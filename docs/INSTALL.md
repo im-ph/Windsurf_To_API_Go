@@ -6,7 +6,7 @@
 
 ### 前置
 
-- Go ≥ 1.22
+- Go ≥ 1.26.2（`go.mod` 里的 `go` directive 值）
 - Node.js ≥ 20 + `pnpm`（仅当你要改前端时才需要；仓库已提交 `internal/web/dist/` 构建产物）
 - Git
 

@@ -2,6 +2,20 @@
 
 所有有意义的变更都会记录在本文件。版本采用 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.1-go] — 2026-04-21
+
+安全与依赖维护版本。
+
+### 安全
+
+- 升级 `golang.org/x/net` `v0.34.0 → v0.36.0` 修复 CVE-2025-22870（HTTP Proxy bypass via IPv6 Zone IDs）。本服务的代理链路由 `proxycfg` 内部显式拼装，不走用户输入，真实影响面低，但仍按最小惊讶原则随上游升级
+- 新增 [SECURITY.md](SECURITY.md) 说明漏洞披露渠道、扫描器两条误报（Firebase 公开 apiKey、`@ant-design/colors` 被字符串匹配误认成 Marak 的 `colors`）、以及固有安全特性清单
+
+### 其它
+
+- `go.mod` 的 `go` directive 升到 `1.26.2`，与本机工具链对齐
+- 依赖 `golang.org/x/text` 传递升级 `v0.21.0 → v0.22.0`
+
 ## [1.2.0-go] — 2026-04-21
 
 首个提交 CNB 的版本。相对于 JS 原版的完整功能等价，外加若干运维侧改进。

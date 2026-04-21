@@ -2,7 +2,7 @@
 
 将 Windsurf 的官方 Language Server 封装为 OpenAI / Anthropic 兼容的单文件反向代理，自带管理控制台。零运行时依赖，除同目录下的 `language_server_linux_x64` 外无需额外文件。
 
-- **语言 / 运行时**：Go ≥ 1.22，静态编译，Linux amd64 产物约 9 MB
+- **语言 / 运行时**：Go ≥ 1.26.2，静态编译，Linux amd64 产物约 9 MB
 - **内嵌前端**：Vue 3 + TypeScript + Ant Design Vue 4，`//go:embed` 打入二进制
 - **兼容协议**：OpenAI `/v1/chat/completions` + Anthropic `/v1/messages`（原生 SSE 透传）
 - **账号池**：分层 RPM 加权调度、按模型级别的限速/限流隔离、Firebase 令牌自动刷新
@@ -119,9 +119,4 @@ Windsurf_To_API_Go/
 
 ## 协议
 
-与 JS 原仓一致：非商业 / 非转售 / 非中转。未经书面许可不得用于商业发行。
-
-## 上游
-
-- JS 原版：https://github.com/dwgx/WindsurfAPI
-- 本 Go 重写版仓库：https://cnb.cool/Neko_Kernel/Windsurf_To_API_Go
+[MIT License](LICENSE)。
