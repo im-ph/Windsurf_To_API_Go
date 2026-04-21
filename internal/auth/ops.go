@@ -180,7 +180,17 @@ func (p *Pool) RefreshCredits(id string, resolve proxyResolver) CreditRefresh {
 	return CreditRefresh{ID: id, Email: a.Email, OK: true}
 }
 
-// RefreshAllCredits walks every active account sequentially (mirrors JS).
+// RefreshAllCredits walks every active account. Parallelised with a small
+// concurrency limit so one slow / unreachable GetUserStatus (e.g. upstream
+// network glitch, rate-limit on the seat-management endpoint) can't stall
+// the whole 15-min refresh loop — with sequential processing and 30 active
+// accounts each taking up to ~30s to fail, a run could overshoot the
+// interval entirely and back up credits indefinitely.
+//
+// concurrency=4 is a conservative bound — each refresh hits the same
+// upstream host so too much parallelism would just trigger upstream rate
+// limiting; four in-flight stays well below that ceiling while capping the
+// worst-case sequential wall time at roughly `ceil(N/4) × 30s`.
 func (p *Pool) RefreshAllCredits(resolve proxyResolver) []CreditRefresh {
 	p.mu.RLock()
 	var ids []string
@@ -190,10 +200,20 @@ func (p *Pool) RefreshAllCredits(resolve proxyResolver) []CreditRefresh {
 		}
 	}
 	p.mu.RUnlock()
-	out := make([]CreditRefresh, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, p.RefreshCredits(id, resolve))
+	out := make([]CreditRefresh, len(ids))
+	const workers = 4
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(i int, id string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			out[i] = p.RefreshCredits(id, resolve)
+		}(i, id)
 	}
+	wg.Wait()
 	return out
 }
 

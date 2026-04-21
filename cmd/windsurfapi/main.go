@@ -137,6 +137,19 @@ func main() {
 		Addr:              fmt.Sprintf("%s:%d", cfg.BindHost, cfg.Port),
 		Handler:           server.Handler(deps),
 		ReadHeaderTimeout: 10 * time.Second,
+		// IdleTimeout drops keep-alive connections that stay silent — caps
+		// the exposure of a slowloris-style DoS where an attacker holds
+		// thousands of idle TCP sessions against our open FD budget.
+		IdleTimeout: 120 * time.Second,
+		// MaxHeaderBytes trims runaway header attacks below the default 1
+		// MB which can combine with many concurrent requests to pressure
+		// RAM on the 1 GB VM.
+		MaxHeaderBytes: 64 << 10,
+		// Intentionally no ReadTimeout / WriteTimeout here: /v1/chat/completions
+		// and /v1/messages are long-running SSE streams whose total duration
+		// exceeds any reasonable Read/Write cap. Body-read duration for
+		// non-stream requests is bounded by the 8 MB MaxBytesReader + the
+		// per-handler request context on the chat paths.
 	}
 
 	logx.Info("Server on http://%s:%d", cfg.BindHost, cfg.Port)

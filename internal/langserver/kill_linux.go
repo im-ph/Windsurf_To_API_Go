@@ -49,6 +49,16 @@ func killOrphanOnPort(port int) {
 			// link looks like "socket:[123456]"
 			for _, ino := range inodes {
 				if link == "socket:["+ino+"]" {
+					// Confirm the target really is a Windsurf LS before
+					// SIGKILLing — in a fast fork environment PIDs cycle
+					// and /proc/<pid>/fd could point at a reaped socket
+					// whose PID is now owned by an unrelated process.
+					// Reading /proc/<pid>/cmdline is cheap and gives us a
+					// definitive "yes this is our LS" signal.
+					if !isLSProcess(ent.Name()) {
+						logx.Warn("killOrphanOnPort: pid=%d owns port %d but cmdline doesn't look like an LS — skipping", pid, port)
+						break inner
+					}
 					logx.Warn("killOrphanOnPort: SIGKILL pid=%d (owns port %d)", pid, port)
 					_ = syscall.Kill(pid, syscall.SIGKILL)
 					break inner
@@ -56,6 +66,29 @@ func killOrphanOnPort(port int) {
 			}
 		}
 	}
+}
+
+// isLSProcess reports whether /proc/<pid>/cmdline names the Windsurf LS
+// binary. cmdline uses NUL separators; we just need the first component.
+func isLSProcess(pid string) bool {
+	data, err := os.ReadFile("/proc/" + pid + "/cmdline")
+	if err != nil {
+		return false
+	}
+	// First arg ends at the first NUL.
+	if i := indexByte(data, 0); i >= 0 {
+		data = data[:i]
+	}
+	return strings.Contains(string(data), "language_server")
+}
+
+func indexByte(s []byte, b byte) int {
+	for i, c := range s {
+		if c == b {
+			return i
+		}
+	}
+	return -1
 }
 
 // listenInodes parses /proc/net/tcp{,6} and returns inode strings for

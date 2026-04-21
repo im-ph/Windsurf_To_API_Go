@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"regexp"
 	"sort"
 	"sync"
 	"time"
@@ -460,7 +459,9 @@ func (p *Pool) Acquire(tried []string, modelKey string) *Selected {
 		if _, skip := triedSet[a.APIKey]; skip {
 			continue
 		}
-		if isRateLimited(a, modelKey, now) {
+		// Write-lock is held here, so the RW variant can prune expired
+		// per-model entries inline without racing readers.
+		if isRateLimitedRW(a, modelKey, now) {
 			continue
 		}
 		limit := tierRPM[a.Tier]
@@ -511,7 +512,7 @@ func (p *Pool) AcquireByKey(apiKey, modelKey string) *Selected {
 		if a.Status != StatusActive {
 			return nil
 		}
-		if isRateLimited(a, modelKey, now) {
+		if isRateLimitedRW(a, modelKey, now) {
 			return nil
 		}
 		limit := tierRPM[a.Tier]
@@ -762,23 +763,7 @@ func (p *Pool) RateLimitView(id string) RateLimitView {
 		if a.ID != id {
 			continue
 		}
-		v := RateLimitView{
-			Models:       map[string]int64{},
-			ModelStarted: map[string]int64{},
-		}
-		if a.RateLimitedUntil > now {
-			v.AccountUntil = a.RateLimitedUntil
-			v.AccountStarted = a.RateLimitedStarted
-		}
-		for k, until := range a.ModelRateLimits {
-			if until > now {
-				v.Models[k] = until
-				if a.ModelRateStarted != nil {
-					v.ModelStarted[k] = a.ModelRateStarted[k]
-				}
-			}
-		}
-		return v
+		return buildRLView(a, now)
 	}
 	return RateLimitView{
 		Models:       map[string]int64{},
@@ -786,7 +771,74 @@ func (p *Pool) RateLimitView(id string) RateLimitView {
 	}
 }
 
+// RateLimitViews returns per-id views in a single lock acquisition. Used by
+// the dashboard accountsView path, which previously called `RateLimitView`
+// N times — with 30+ accounts that's 30 RLock/RUnlock round-trips in the
+// hot dashboard poll and contends with every writer (probe, markRateLimited,
+// credit refresh), producing 100-ms latency spikes on a busy pool. One RLock
+// holds everything for the duration of the walk; view objects are plain
+// copies so we don't alias the live maps.
+func (p *Pool) RateLimitViews() map[string]RateLimitView {
+	now := time.Now().UnixMilli()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make(map[string]RateLimitView, len(p.accounts))
+	for _, a := range p.accounts {
+		out[a.ID] = buildRLView(a, now)
+	}
+	return out
+}
+
+// buildRLView materialises a RateLimitView from an *Account. Caller holds
+// the pool lock. Expired windows are elided so the UI only sees what's
+// currently keeping a row out of the selector.
+func buildRLView(a *Account, now int64) RateLimitView {
+	v := RateLimitView{
+		Models:       map[string]int64{},
+		ModelStarted: map[string]int64{},
+	}
+	if a.RateLimitedUntil > now {
+		v.AccountUntil = a.RateLimitedUntil
+		v.AccountStarted = a.RateLimitedStarted
+	}
+	for k, until := range a.ModelRateLimits {
+		if until > now {
+			v.Models[k] = until
+			if a.ModelRateStarted != nil {
+				v.ModelStarted[k] = a.ModelRateStarted[k]
+			}
+		}
+	}
+	return v
+}
+
+// isRateLimited reports whether account `a` is currently rate-limited for
+// `modelKey`. **Expired windows are NOT deleted here** — the caller's lock
+// discipline decides whether cleanup is allowed. Use isRateLimitedRW below
+// for the write-lock-held path where it's safe to prune.
+//
+// Previously the single `isRateLimited` also deleted expired entries from
+// `a.ModelRateLimits`, but `IsAllRateLimited` (line 542) calls it under
+// RLock — mixing a map write with concurrent `MarkRateLimited` writes
+// triggers Go's `fatal error: concurrent map read and map write`, which
+// takes the whole process down. Separating the two paths removes the
+// race without changing behaviour for callers that genuinely need cleanup.
 func isRateLimited(a *Account, modelKey string, now int64) bool {
+	if a.RateLimitedUntil > now {
+		return true
+	}
+	if modelKey != "" {
+		if t, ok := a.ModelRateLimits[modelKey]; ok && t > now {
+			return true
+		}
+	}
+	return false
+}
+
+// isRateLimitedRW is the "caller holds Pool.mu.Lock" variant — safe to
+// prune expired entries. Use from Acquire / AcquireByKey where we already
+// hold the write lock.
+func isRateLimitedRW(a *Account, modelKey string, now int64) bool {
 	if a.RateLimitedUntil > now {
 		return true
 	}
@@ -835,8 +887,6 @@ func inferTier(caps map[string]Capability) string {
 	}
 	return "unknown"
 }
-
-var _ = regexp.MustCompile // placeholder — regex-backed tier detection lives in cloud layer
 
 func newID() string {
 	var b [4]byte

@@ -447,6 +447,10 @@ func (d *Deps) overview(w http.ResponseWriter) {
 func (d *Deps) accountsView() []map[string]any {
 	now := time.Now().UnixMilli()
 	all := d.Pool.All()
+	// One batched RateLimitViews call replaces N per-account RLock round-trips
+	// — with 30+ accounts the old per-row RateLimitView lookup was the biggest
+	// contention source against concurrent pool writers.
+	rlviews := d.Pool.RateLimitViews()
 	out := make([]map[string]any, 0, len(all))
 	for _, a := range all {
 		keyPrefix := a.APIKey
@@ -484,7 +488,10 @@ func (d *Deps) accountsView() []map[string]any {
 		}
 		row["rpmUsed"] = 0
 		row["rpmLimit"] = tierRPMFor(a.Tier)
-		rlv := d.Pool.RateLimitView(a.ID)
+		rlv, ok := rlviews[a.ID]
+		if !ok {
+			rlv = auth.RateLimitView{Models: map[string]int64{}, ModelStarted: map[string]int64{}}
+		}
 		// rateLimited = "is anything keeping this account out of selection
 		// right now" so the dashboard can render a simple indicator without
 		// needing to re-derive from the per-model map. The `started` maps
@@ -856,6 +863,19 @@ func (d *Deps) gitStatusHandler(w http.ResponseWriter) {
 }
 
 func (d *Deps) selfUpdate(w http.ResponseWriter, body map[string]any) {
+	// Require an explicit `confirm:true` in the POST body. The dashboard UI
+	// already gates this behind an OK/Cancel modal; insisting on the flag
+	// server-side closes the "CSRF-via-leaked-dashboard-password" window,
+	// where an attacker with a stolen password could fire `/self-update`
+	// from any origin and trigger a `git pull` + process restart without
+	// an interactive click. No confirm → 400, no mutation.
+	if confirm, _ := body["confirm"].(bool); !confirm {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": "Send { confirm: true } to apply updates",
+		})
+		return
+	}
 	before, err := gitInfo()
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
@@ -1029,7 +1049,31 @@ func (d *Deps) testProxy(w http.ResponseWriter, body map[string]any) {
 // connectTunnelIP opens an HTTP CONNECT tunnel to api.ipify.org and returns
 // the egress IP the proxy presents. Same flow as the JS testProxy().
 func connectTunnelIP(host string, port int, user, pass string) (string, error) {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 10*time.Second)
+	// DNS-rebinding defence: isPrivateHost only catches literal private IPs
+	// and well-known hostnames. An attacker-controlled DNS can return a
+	// public IP on first lookup and a private IP on second — net.DialTimeout
+	// would happily connect to the second. Resolve explicitly and reject
+	// any private IP before we dial, then pin the dial target to the first
+	// verified public IP so Happy Eyeballs can't swap in an unverified one.
+	dnsCtx, dnsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dnsCancel()
+	ips, err := (&net.Resolver{}).LookupIP(dnsCtx, "ip", host)
+	if err != nil {
+		return "", fmt.Errorf("解析 DNS 失败: %s", err.Error())
+	}
+	var safe net.IP
+	for _, ip := range ips {
+		if isPrivateIP(ip) {
+			return "", fmt.Errorf("代理主机解析到内网地址 %s，拒绝连接", ip.String())
+		}
+		if safe == nil {
+			safe = ip
+		}
+	}
+	if safe == nil {
+		return "", fmt.Errorf("代理主机无可用 IP")
+	}
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", safe.String(), port), 10*time.Second)
 	if err != nil {
 		return "", fmt.Errorf("连接失败: %s", err.Error())
 	}

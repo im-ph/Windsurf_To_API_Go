@@ -134,7 +134,16 @@ func doPost(urlStr string, body []byte, proxy *langserver.Proxy, headers map[str
 		}
 		return 0, nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Drain any unread bytes past our 10 MB cap before Close so the
+		// underlying TCP connection can go back in the keep-alive pool.
+		// Without this, an upstream that writes >10 MB (which LimitReader
+		// silently truncates) leaves the socket mid-stream and net/http
+		// abandons it → connection churn on every oversize response during
+		// a rate-limit storm.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
 		return resp.StatusCode, nil, err

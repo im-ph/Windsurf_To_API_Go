@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -218,10 +219,14 @@ func Snapshot() Stats {
 	}
 }
 
-// small atomic helpers (sync/atomic.AddUint64 needs aligned uint64 on 32-bit;
-// using package-level globals is fine on 64-bit hosts which is all we ship to).
-func incr(p *uint64) { *p++ }
-func load(p *uint64) uint64 { return *p }
+// Atomic counter helpers — previously bare `*p++` / `*p`. Even though `Snapshot`
+// and `incr` are mostly reached while holding `mu`, `Snapshot` releases the
+// lock before reading counters, so `load(&hits)` and a concurrent `incr(&hits)`
+// racing under `mu` produce a Go-vet race flag. Go's `atomic` primitives cost
+// the same nanosecond on amd64 and silence both the vet warning and any
+// torn-read risk on ARM64 deployments.
+func incr(p *uint64) { atomic.AddUint64(p, 1) }
+func load(p *uint64) uint64 { return atomic.LoadUint64(p) }
 
 func fmtFloat(f float64) string {
 	intPart := int(f)

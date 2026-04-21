@@ -116,12 +116,20 @@ type Pool struct {
 	apiServer  string
 	entries    map[string]*Entry // proxyKey → Entry
 	nextPort   int
+	// spawning serialises concurrent Ensure() on the same proxyKey. Without
+	// it, two simultaneous requests for px_foo_8080 would both miss the
+	// entry lookup, each consume a different nextPort, each spawn an LS,
+	// and only the last write to `entries[key]` would win — the other LS
+	// becomes an unmanaged orphan with no StopAll hook. Closing the chan
+	// releases waiters.
+	spawning map[string]chan struct{}
 }
 
 // New creates an empty pool. Call Config to set binary path + API server.
 func New() *Pool {
 	return &Pool{
 		entries:  map[string]*Entry{},
+		spawning: map[string]chan struct{}{},
 		nextPort: 42101,
 	}
 }
@@ -202,10 +210,36 @@ func waitPortReady(port int, timeout time.Duration) error {
 // Ensure spawns (or returns an existing) Entry for the given proxy.
 func (p *Pool) Ensure(ctx context.Context, px *Proxy) (*Entry, error) {
 	key := proxyKey(px)
-	p.mu.Lock()
-	if e, ok := p.entries[key]; ok && e.Ready {
-		p.mu.Unlock()
-		return e, nil
+	for {
+		p.mu.Lock()
+		if e, ok := p.entries[key]; ok && e.Ready {
+			p.mu.Unlock()
+			return e, nil
+		}
+		// Another goroutine is already spawning this key — park on the
+		// shared channel and retry once it signals.
+		if ch, inFlight := p.spawning[key]; inFlight {
+			p.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-ch:
+				// Winner finished; loop to read the entry (or retry on failure).
+			}
+			continue
+		}
+		// We're the winner — claim the slot and drop the lock to do the
+		// slow work (spawn + port-ready poll). Close the channel on exit
+		// so parked goroutines proceed.
+		done := make(chan struct{})
+		p.spawning[key] = done
+		defer func() {
+			p.mu.Lock()
+			delete(p.spawning, key)
+			p.mu.Unlock()
+			close(done)
+		}()
+		break
 	}
 
 	isDefault := key == "default"

@@ -40,15 +40,26 @@ func Init() {
 	}
 }
 
+// save serialises the current state + queues the disk write asynchronously.
+// The write itself is behind a dedicated saveMu — this keeps save order
+// deterministic without making the hot-path `mu.Lock` drag disk latency
+// into every `Effective()` / `Get()` call that fires on every chat request.
+var saveMu sync.Mutex
+
 func save() {
+	// Marshal happens synchronously (we hold mu, state is quiescent).
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return
 	}
-	// Atomic write: write to a temp file then rename — consistent with
-	// atomicfile.Write gives us a per-call unique tmp name + 0o600 mode so
-	// two concurrent save() calls can't clobber each other's .tmp draft.
-	_ = atomicfile.Write(path, data)
+	// Disk I/O runs async behind its own serialising mu. Chat hot path
+	// readers that only want `Effective()` / `Get()` no longer wait on
+	// disk flush — they only contend for the in-memory state lock.
+	go func(payload []byte) {
+		saveMu.Lock()
+		defer saveMu.Unlock()
+		_ = atomicfile.Write(path, payload)
+	}(data)
 }
 
 // Get returns the full proxy snapshot for the dashboard.

@@ -44,9 +44,18 @@ func Init() {
 	}
 }
 
+// saveMu serialises disk writes so parallel save() calls land in a
+// deterministic order without holding the main mu across I/O.
+var saveMu sync.Mutex
+
 func save() {
 	data, _ := json.MarshalIndent(cfg, "", "  ")
-	_ = atomicfile.Write(path, data)
+	// Disk flush runs async — hot-path `Check()` readers only contend on mu.
+	go func(payload []byte) {
+		saveMu.Lock()
+		defer saveMu.Unlock()
+		_ = atomicfile.Write(path, payload)
+	}(data)
 }
 
 // Get returns a copy of the current config. The list is always non-nil so

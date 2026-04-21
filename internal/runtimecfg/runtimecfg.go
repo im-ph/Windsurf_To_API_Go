@@ -74,15 +74,24 @@ func Init() {
 	}
 }
 
+// saveMu serialises disk writes so a burst of toggle changes doesn't
+// interleave on the filesystem.
+var saveMu sync.Mutex
+
 func persist() {
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		logx.Warn("runtime-config: marshal: %s", err.Error())
 		return
 	}
-	if err := atomicfile.Write(path, data); err != nil {
-		logx.Warn("runtime-config: write: %s", err.Error())
-	}
+	// Hot-path `IsEnabled()` readers shouldn't wait on disk; async the write.
+	go func(payload []byte) {
+		saveMu.Lock()
+		defer saveMu.Unlock()
+		if err := atomicfile.Write(path, payload); err != nil {
+			logx.Warn("runtime-config: write: %s", err.Error())
+		}
+	}(data)
 }
 
 // ─── Experimental flags ────────────────────────────────────

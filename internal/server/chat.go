@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"windsurfapi/internal/auth"
@@ -212,9 +213,13 @@ func (d *Deps) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cache key (only applicable when no streaming or for replay).
+	// IdentityPrompt participates so toggling the identity flag off between
+	// two otherwise-identical requests doesn't replay a previously-stamped
+	// response.
 	ckey := cache.Key(cache.RequestBody{
 		Model: modelKey, Messages: raw, Tools: rawFromTools(body.Tools), ToolChoice: body.ToolChoice,
-		MaxTokens: body.MaxTokens,
+		MaxTokens:      body.MaxTokens,
+		IdentityPrompt: identityPrompt,
 	})
 
 	chatID := genChatID()
@@ -595,13 +600,27 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
+	// http.ResponseWriter.Write is not safe for concurrent use. The heartbeat
+	// goroutine and the main handler both write to w; without this mutex the
+	// two can interleave "data: {...}\n\n" frames mid-write and produce
+	// malformed SSE, or hit Go's built-in race detector. wmu is the single
+	// serialiser every writer must go through.
+	var wmu sync.Mutex
 	send := func(v any) {
 		b, _ := json.Marshal(v)
+		wmu.Lock()
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
 		flusher.Flush()
+		wmu.Unlock()
+	}
+	sendRaw := func(s string) {
+		wmu.Lock()
+		_, _ = fmt.Fprint(w, s)
+		flusher.Flush()
+		wmu.Unlock()
 	}
 
-	// SSE heartbeat
+	// SSE heartbeat — uses the same wmu so ": ping\n\n" never splits a data frame.
 	hbCtx, hbCancel := context.WithCancel(r.Context())
 	defer hbCancel()
 	go func() {
@@ -612,8 +631,14 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 			case <-hbCtx.Done():
 				return
 			case <-t.C:
-				_, _ = fmt.Fprint(w, ": ping\n\n")
-				flusher.Flush()
+				// Re-check cancellation after wait — during a ticker fire
+				// and before we grab wmu, the handler may have already
+				// returned and wmu may be a stale ref; hbCtx.Err() closes
+				// the window where we'd write to a destroyed response.
+				if hbCtx.Err() != nil {
+					return
+				}
+				sendRaw(": ping\n\n")
 			}
 		}
 	}()
@@ -630,8 +655,7 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 			send(chunkContent(in, v.Text))
 		}
 		send(chunkFinish(in, "stop", cachedUsage(in.CascadeMsgs, v.Text)))
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
+		sendRaw("data: [DONE]\n\n")
 		return
 	}
 
@@ -848,8 +872,7 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 			"id": in.ChatID, "object": "chat.completion.chunk", "created": in.Created, "model": in.DisplayModel,
 			"choices": []any{}, "usage": usage,
 		})
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
+		sendRaw("data: [DONE]\n\n")
 
 		if len(collected) == 0 && (accText.Len() > 0 || accThink.Len() > 0) {
 			cache.Set(in.CacheKey, cache.Entry{Text: accText.String(), Thinking: accThink.String()})
@@ -880,8 +903,7 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 			"finish_reason": "stop",
 		}},
 	})
-	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	sendRaw("data: [DONE]\n\n")
 }
 
 // ─── Response body builders ────────────────────────────────

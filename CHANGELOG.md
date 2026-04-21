@@ -2,6 +2,41 @@
 
 所有有意义的变更都会记录在本文件。版本采用 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.4-go] — 2026-04-22
+
+安全审计第二轮。第一轮的 13 条修完 + 延后的若干条补上后，再跑了一轮纵深审计，发现 3 条 CRITICAL + 9 条 HIGH/MEDIUM，全部修完。
+
+### 并发 / 运行时 CRITICAL
+
+- **CRIT R2-#1: `isRateLimited` 在 RLock 下写 map**（[auth/pool.go](internal/auth/pool.go)）—— `IsAllRateLimited` 持 `p.mu.RLock()` 调用 `isRateLimited`，后者 `delete(a.ModelRateLimits, modelKey)` 过期条目。并发 `MarkRateLimited` 持写锁写同一 map → Go runtime `fatal error: concurrent map read and map write` → **进程直接崩**，不可 recover。拆成 `isRateLimited`（只读）+ `isRateLimitedRW`（写锁路径才调），`IsAllRateLimited` 改用只读版
+- **CRIT R2-#2: SSE 心跳并发写 `http.ResponseWriter`**（[server/chat.go](internal/server/chat.go)）—— 心跳 goroutine 的 `fmt.Fprint(w, ": ping\n\n")` 和主循环的 `send()`/`chunkContent` 同时写 `w`，`http.ResponseWriter` 没有并发保证，SSE 帧可撕裂；Go race detector 会报。新增 `wmu sync.Mutex` + `send`/`sendRaw` helper 串行化所有写入；心跳 fire 前再次检查 `hbCtx.Err()` 防止在 handler 已退出后写回收的 response
+- **CRIT R2-#3: LS `Ensure` 对非默认 key 的并发 spawn race**（[langserver/pool.go](internal/langserver/pool.go)）—— 两个请求同时 ensure `px_foo_8080`，都 miss 入口检查，各自拿递增 port 派生 LS 进程；最后一次 `p.entries[key] = entry` 覆盖前者 → **旧 LS 成无管理孤儿，StopAll 永远不会终止它**。新增 `spawning map[string]chan struct{}` 门 —— 后到者 park 在 chan 上，winner 写 `p.entries[key]` 后 close chan 释放 waiters
+
+### HIGH / MEDIUM
+
+- **R2-#4**: `dashapi.testProxy` 的 `connectTunnelIP` 复制了 imagex 的 DNS rebinding 漏洞 —— 只验字面 host，`evil.tld → 127.0.0.1` 照样拨号。改用 `net.Resolver.LookupIP` + 逐 IP `isPrivateIP` 过滤 + pin 到首个合法 IP（[dashapi/dashapi.go](internal/dashapi/dashapi.go)）
+- **R2-#5**: `http.Server` 缺 `IdleTimeout` + `MaxHeaderBytes` → slowloris / keep-alive 洪水可拖住 FD。加 `IdleTimeout=120s` + `MaxHeaderBytes=64 KiB`；`ReadTimeout/WriteTimeout` 不设（SSE 长流会被误杀），body 大小由 `MaxBytesReader` 管控
+- **R2-#6**: `proxycfg.save` / `modelaccess.save` / `runtimecfg.persist` 在 `mu.Lock` 下做同步磁盘 I/O —— chat 热路径的 `Effective()`/`Check()`/`IsEnabled()` 每次请求都要读这个 mu，盘慢 100ms 就放大成全线延迟尖刺。改成 marshal 同步（mu 下）+ 写盘 async goroutine（`saveMu` 串行化）
+- **R2-#7**: `convpool` 的 `incr`/`load` 用非原子 `*p++` / `*p`，Snapshot 在 mu 外读导致 race detector 报警，32-bit / 非 x86 平台有 torn-read 风险。改用 `atomic.AddUint64` / `atomic.LoadUint64`
+- **R2-#10**: `cache.Set` 还在用共享 `<path>.tmp` —— 同样的 race 1.3.3 只修了 5 个持久化路径但漏了 cache。改走 `atomicfile.Write`
+- **R2-#12**: `/dashboard/api/self-update` 没有 `confirm:true` gate，dashboard 密码泄露时 CSRF 跨站 fetch 就能触发 `git pull` + 进程重启。加显式 `confirm` 检查，前端已经有二次确认弹窗
+- **R2-#15**: `kill_linux` 的 orphan 扫描只看 inode 关联，PID 在高 fork 环境下可能回收。SIGKILL 前加 `/proc/<pid>/cmdline` 校验 —— 必须包含 `language_server` 才杀，否则跳过并 Warn
+- **R2-#19**: `cache.Get` 读出损坏 JSON 时未清理 LRU 条目，每次 Get 都再读同一坏文件 → 永远 miss、永远不让位给新 entry。`Unmarshal` 失败分支现在也走 `removeLocked`
+
+### 遗留（下一轮再处理）
+
+- R2-#8 `logx.emit` 在 mu 下写磁盘的 head-of-line 阻塞 —— 需要引入带缓冲的异步 writer goroutine，改动面较大
+- R2-#14 `imagex.safeDial` 当 DNS 返回公网+内网混合时一律拒绝，可能误伤 split-horizon CDN
+- R2-#11 / R2-#13 / R2-#16 / R2-#17 / R2-#18 / R2-#20-#23 —— 低优先级防御加固或误报，后续迭代处理
+
+### 其它清理
+
+- 移除 `auth/pool.go` 未使用的 `regexp` 导入 + dead `var _ = regexp.MustCompile` 占位行
+- `cloud/transport.go` `doPost` 在 Close 前 `io.Copy(io.Discard, resp.Body)` 耗尽 `LimitReader` 截断后残留的字节，让连接能重入 keep-alive pool（速率风暴下减少 socket churn）
+- `RefreshAllCredits` 从完全串行改为 4-并发 —— 一个慢账号（30s 超时）不再卡住整个 15min 循环
+- `Pool.RateLimitViews` 单次锁返回全部账号的 view，替代 `accountsView` 里 N 次 per-account `RateLimitView(id)` 的 thundering herd
+- `cache.RequestBody` 增加 `IdentityPrompt` 字段：身份注入开关在两次请求间切换时，避免旧响应被错误 replay
+
 ## [1.3.3-go] — 2026-04-22
 
 生产上线前的安全审计批次 —— 外部审计代理扫出的 13 条 CRITICAL / HIGH / MEDIUM 问题全部修完。

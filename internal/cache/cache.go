@@ -34,6 +34,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"windsurfapi/internal/atomicfile"
 )
 
 // Defaults — overridden by Init() when called with non-empty args.
@@ -111,14 +113,23 @@ func Init(cacheDir string, maxEntries int, entryTTL time.Duration) {
 
 // KeyFromRequest hashes the subset of the request body that actually changes
 // semantic output — matches src/cache.js normalize().
+//
+// IdentityPrompt is a server-side toggle (runtimecfg flag), NOT part of the
+// client's request. Without including it in the key, flipping the flag
+// between request A (stamped) and request B (not stamped) lets B re-serve
+// A's response — the cached text still carries whatever identity was
+// injected at generation time. Participating the flag's identity string
+// in the key sidesteps that confusion; toggling it off naturally misses
+// previously-stamped cache entries.
 type RequestBody struct {
-	Model       string          `json:"model"`
-	Messages    json.RawMessage `json:"messages"`
-	Tools       json.RawMessage `json:"tools,omitempty"`
-	ToolChoice  json.RawMessage `json:"tool_choice,omitempty"`
-	Temperature *float64        `json:"temperature,omitempty"`
-	TopP        *float64        `json:"top_p,omitempty"`
-	MaxTokens   *int            `json:"max_tokens,omitempty"`
+	Model          string          `json:"model"`
+	Messages       json.RawMessage `json:"messages"`
+	Tools          json.RawMessage `json:"tools,omitempty"`
+	ToolChoice     json.RawMessage `json:"tool_choice,omitempty"`
+	Temperature    *float64        `json:"temperature,omitempty"`
+	TopP           *float64        `json:"top_p,omitempty"`
+	MaxTokens      *int            `json:"max_tokens,omitempty"`
+	IdentityPrompt string          `json:"identityPrompt,omitempty"`
 }
 
 func Key(body RequestBody) string {
@@ -163,6 +174,15 @@ func Get(k string) (Entry, bool) {
 	}
 	var e Entry
 	if json.Unmarshal(raw, &e) != nil {
+		// Corrupt blob — previously we just returned miss but left the
+		// index entry in place, which made every subsequent Get re-read
+		// the same bad file and re-report miss. Clean it up so the next
+		// Set gets a fresh slot.
+		mu.Lock()
+		if el2, ok := idx[k]; ok && el2 == el {
+			removeLocked(el, r)
+		}
+		mu.Unlock()
 		atomic.AddUint64(&misses, 1)
 		return Entry{}, false
 	}
@@ -180,13 +200,12 @@ func Set(k string, v Entry) {
 		return
 	}
 	path := pathFor(k)
-	// Atomic write so a concurrent Get never sees a torn file.
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, blob, 0o600); err != nil {
-		return
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
+	// atomicfile.Write generates a unique per-call tmp name + 0o600 so two
+	// concurrent Set(sameKey) calls can't clobber each other's .tmp draft —
+	// the shared `<path>.tmp` collision was the same class of bug round 1
+	// fixed in the auth/proxycfg/modelaccess/runtimecfg/stats persistence
+	// paths; cache Set got missed in that sweep.
+	if err := atomicfile.Write(path, blob); err != nil {
 		return
 	}
 
