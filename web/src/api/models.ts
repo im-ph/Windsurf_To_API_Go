@@ -1,8 +1,12 @@
 import { http } from './request';
-import type { ModelAccessConfig, ModelInfo } from './types';
+import type { CatalogResponse, ModelAccessConfig, ModelInfo } from './types';
 
 export function listModels(): Promise<{ models: ModelInfo[] }> {
   return http.get<{ models: ModelInfo[] }>('/models');
+}
+
+export function listModelCatalog(): Promise<CatalogResponse> {
+  return http.get<CatalogResponse>('/models/catalog');
 }
 
 export function getModelAccess(): Promise<ModelAccessConfig> {

@@ -2,6 +2,38 @@
 
 所有有意义的变更都会记录在本文件。版本采用 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.0-go] — 2026-04-22
+
+控制台能力扩展与若干稳定性修复。
+
+### 新增
+
+- **仪表盘系统指标卡栏**：CPU 使用率 / 内存 / SWAP / 下行带宽 / 上行带宽 / 系统负载 —— 均通过新模块 `internal/sysinfo` 直接读取 `/proc/stat`、`/proc/meminfo`、`/proc/net/dev`、`/proc/loadavg`，无第三方依赖；超 70% 染黄、超 90% 染红；Windows/macOS 下返回零值而非崩溃
+- **仪表盘 Token 与费用卡栏**：总 Token 消耗（输入 / 输出 / 总量）与等价总费用（USD），按各家官方公开价格表折算。价格表见 `internal/models/pricing.go`，涵盖 50+ 主流模型，未登记的按默认 `$1/M input · $5/M output` 保底
+- **仪表盘"模型清单"框**：按厂商分组（Claude / GPT / Gemini / DeepSeek / Grok / Qwen / Kimi / GLM / MiniMax / Windsurf SWE / Arena），每款模型显示展示名 + 模型 ID + 能力总分（0-100）。能力评分表在 `internal/models/scoring.go`，手工校准 80+ 条目；未命中表的新模型通过 `inferScore()` 基于家族基分 + 版本 + 后缀（`-high/-low/-xhigh/-max/-thinking/-mini/-nano` 等）推断
+- **仪表盘上游状态码分布**：LS 实例卡底部按色标展示 2xx / 3xx / 4xx / 5xx / 传输错误的直方图
+- **仪表盘版本 + 可用模型数卡栏**：版本号（来自 `/health`）+ `<允许数> / <总数>` 以及当前访问模式（全部放行 / 允许清单 / 封锁清单）
+- **鼠标悬停滚动长名称**：新组件 `MarqueeText.vue`，长度超容器时悬停左滑显示尾部，右边界带遮罩淡出；离开后回弹
+- **模型名称统一格式化**：工具 `web/src/utils/modelName.ts` 与 Go 侧 `models.DisplayName()` 双向一致，将 `claude-opus-4-7-high` 等云端模型 UID 自动还原为 `Claude Opus 4.7 High`；统计分析、异常监测、仪表盘三处都走同一格式
+- **模型目录云端刷新**：`FetchModelCatalog` 从启动一次改为每 **2 小时**定时拉取，新发布的云端模型自动进入目录，无需重启
+- **异常监测层级大小写**：`pro → Pro`、`free → Free`、`expired → Expired`、`unknown → Unknown`，原始枚举值只保留在 API 层
+
+### 修复
+
+- **LS 连接 `dial tcp [::1]:<port>: connection refused` 间歇性报错**：gRPC 客户端基址从 `http://localhost:<port>` 改为 `http://127.0.0.1:<port>`，绕过 IPv6 `::1` 优先解析与 LS 仅绑定 IPv4 之间的不匹配（`internal/grpcx/grpcx.go`）
+- **LS 领养的僵尸 Entry**：端口已被占用时的"领养"分支没有 `Process` 引用、没有 `cmd.Wait()` 监控；被领养的进程死了之后 Entry 永久残留，所有请求打死端口。新增领养专用看门狗 goroutine，每 5s 探测一次端口，连续两次不通就从池里删除 Entry 触发下次请求重新 `Ensure`（`internal/langserver/pool.go`）
+- **LS 重启成功提示显示红 X 无内容**：`toast({ message: '已触发重启' }, '')` 把非 Error 对象传给只调 `message.error()` 的 toast helper，结果渲染空错误；改为直接 `message.success('已触发重启')`
+
+### 移除
+
+- 仪表盘右上角的"检查更新 / 一键更新并重启"按钮与对应的 `<Alert>` 提示条：实际部署以 systemd + SFTP 为主，旧 `git pull` 自更新路径对当前部署方式无意义
+
+### 改进
+
+- 服务端配置卡栏的"默认模型"字段走 `displayModelName()` 转成易读名称；"最大 tokens" 标签改为 "最大 Token"
+- 厂商分组将 OpenAI O-Series（`o3` / `o3-pro` / `o4-mini`）合并进 GPT；云端 `MODEL_*` 前缀带 UID 的条目（如 `model-claude-4-opus-byok`）正确归入 Claude 组
+- 领养 Entry 由 `Ready: true` 标记，新增 `convpool.InvalidateFor` 清理，避免在 LS 漂移时复用失效的 cascade_id
+
 ## [1.2.1-go] — 2026-04-21
 
 安全与依赖维护版本。

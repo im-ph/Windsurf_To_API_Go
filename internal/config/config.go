@@ -11,6 +11,11 @@ import (
 )
 
 type Config struct {
+	// BindHost restricts the HTTP listener to a specific interface. Defaults
+	// to "0.0.0.0" (all interfaces) to preserve existing behaviour. Set to
+	// "127.0.0.1" when fronted by a reverse proxy (Caddy, Nginx) so the
+	// public can only reach the proxy — closing the direct :PORT door.
+	BindHost string
 	Port     int
 	APIKey   string
 
@@ -43,6 +48,7 @@ func Load() *Config {
 	loadDotEnv(".env")
 
 	c := &Config{
+		BindHost:          envStr("BIND_HOST", "0.0.0.0"),
 		Port:              envInt("PORT", 3003),
 		APIKey:            os.Getenv("API_KEY"),
 		CodeiumAuthToken:  os.Getenv("CODEIUM_AUTH_TOKEN"),

@@ -51,8 +51,14 @@ type Client struct {
 	baseURL  string
 }
 
-// New constructs a Client aimed at http://localhost:<port>. The h2c transport
+// New constructs a Client aimed at http://127.0.0.1:<port>. The h2c transport
 // dials plain TCP and upgrades — identical to what Node's http2.connect does.
+//
+// The host literal is IPv4 (not "localhost") on purpose: on Linux boxes with
+// an IPv6 stack, "localhost" resolves to both 127.0.0.1 and ::1, Go picks
+// ::1 first under Happy Eyeballs, and the LS only listens on IPv4 — producing
+// "dial tcp [::1]:<port>: connect: connection refused" even though IPv4 is
+// fine. Dialling 127.0.0.1 outright sidesteps the resolver entirely.
 func New(port int, csrf string) *Client {
 	tr := &http2.Transport{
 		AllowHTTP: true,
@@ -69,7 +75,7 @@ func New(port int, csrf string) *Client {
 		port:    port,
 		csrf:    csrf,
 		hc:      hc,
-		baseURL: fmt.Sprintf("http://localhost:%d", port),
+		baseURL: fmt.Sprintf("http://127.0.0.1:%d", port),
 	}
 }
 

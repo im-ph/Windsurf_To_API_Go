@@ -7,19 +7,25 @@ import (
 	"encoding/json"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
+
+	"windsurfapi/internal/models"
 )
 
 type ModelCounts struct {
-	Requests int     `json:"requests"`
-	Success  int     `json:"success"`
-	Errors   int     `json:"errors"`
-	TotalMs  int64   `json:"totalMs"`
-	AvgMs    int64   `json:"avgMs"`
-	P50Ms    int64   `json:"p50Ms"`
-	P95Ms    int64   `json:"p95Ms"`
-	recent   []int64 `json:"-"`
+	Requests     int     `json:"requests"`
+	Success      int     `json:"success"`
+	Errors       int     `json:"errors"`
+	TotalMs      int64   `json:"totalMs"`
+	AvgMs        int64   `json:"avgMs"`
+	P50Ms        int64   `json:"p50Ms"`
+	P95Ms        int64   `json:"p95Ms"`
+	InputTokens  int64   `json:"inputTokens"`
+	OutputTokens int64   `json:"outputTokens"`
+	CostUSD      float64 `json:"costUsd"`
+	recent       []int64 `json:"-"`
 }
 
 type AccountCounts struct {
@@ -35,21 +41,29 @@ type HourBucket struct {
 }
 
 type internalState struct {
-	StartedAt     int64                     `json:"startedAt"`
-	TotalRequests int                       `json:"totalRequests"`
-	SuccessCount  int                       `json:"successCount"`
-	ErrorCount    int                       `json:"errorCount"`
-	ModelCounts   map[string]*ModelCounts   `json:"modelCounts"`
-	AccountCounts map[string]*AccountCounts `json:"accountCounts"`
-	HourlyBuckets []HourBucket              `json:"hourlyBuckets"`
+	StartedAt         int64                     `json:"startedAt"`
+	TotalRequests     int                       `json:"totalRequests"`
+	SuccessCount      int                       `json:"successCount"`
+	ErrorCount        int                       `json:"errorCount"`
+	TotalInputTokens  int64                     `json:"totalInputTokens"`
+	TotalOutputTokens int64                     `json:"totalOutputTokens"`
+	TotalCostUSD      float64                   `json:"totalCostUsd"`
+	// UpstreamStatus counts HTTP status codes returned by the upstream to
+	// this service. Keys are string for easy JSON consumption ("200", "429",
+	// "5xx_transport" for socket-level errors with no HTTP status).
+	UpstreamStatus map[string]int            `json:"upstreamStatus"`
+	ModelCounts    map[string]*ModelCounts   `json:"modelCounts"`
+	AccountCounts  map[string]*AccountCounts `json:"accountCounts"`
+	HourlyBuckets  []HourBucket              `json:"hourlyBuckets"`
 }
 
 var (
 	mu    sync.Mutex
 	state = internalState{
-		StartedAt:     time.Now().UnixMilli(),
-		ModelCounts:   map[string]*ModelCounts{},
-		AccountCounts: map[string]*AccountCounts{},
+		StartedAt:      time.Now().UnixMilli(),
+		UpstreamStatus: map[string]int{},
+		ModelCounts:    map[string]*ModelCounts{},
+		AccountCounts:  map[string]*AccountCounts{},
 	}
 	path    = "stats.json"
 	saveTmr *time.Timer
@@ -67,6 +81,9 @@ func Init() {
 	}
 	if state.AccountCounts == nil {
 		state.AccountCounts = map[string]*AccountCounts{}
+	}
+	if state.UpstreamStatus == nil {
+		state.UpstreamStatus = map[string]int{}
 	}
 	if state.StartedAt == 0 {
 		state.StartedAt = time.Now().UnixMilli()
@@ -90,8 +107,11 @@ func getHourKey() string {
 	return time.Date(d.Year(), d.Month(), d.Day(), d.Hour(), 0, 0, 0, time.UTC).Format(time.RFC3339)
 }
 
-// Record one completed request.
-func Record(model string, success bool, durationMs int64, accountID string) {
+// Record one completed request. token counts + upstreamStatus are optional
+// (pass 0 / 0 / 0 when unavailable).
+func Record(model string, success bool, durationMs int64, accountID string,
+	inputTokens, outputTokens int64, upstreamStatus int,
+) {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -101,6 +121,27 @@ func Record(model string, success bool, durationMs int64, accountID string) {
 	} else {
 		state.ErrorCount++
 	}
+
+	// Upstream status code histogram — 0 means "didn't reach upstream"
+	// (treated as a transport_error bucket).
+	if state.UpstreamStatus == nil {
+		state.UpstreamStatus = map[string]int{}
+	}
+	statusKey := "0"
+	if upstreamStatus > 0 {
+		statusKey = strconv.Itoa(upstreamStatus)
+	}
+	state.UpstreamStatus[statusKey]++
+
+	// Token + cost accounting at the global level.
+	if inputTokens > 0 {
+		state.TotalInputTokens += inputTokens
+	}
+	if outputTokens > 0 {
+		state.TotalOutputTokens += outputTokens
+	}
+	cost := models.PriceFor(model, inputTokens, outputTokens)
+	state.TotalCostUSD += cost
 
 	mc, ok := state.ModelCounts[model]
 	if !ok {
@@ -120,6 +161,9 @@ func Record(model string, success bool, durationMs int64, accountID string) {
 			mc.recent = mc.recent[len(mc.recent)-200:]
 		}
 	}
+	mc.InputTokens += inputTokens
+	mc.OutputTokens += outputTokens
+	mc.CostUSD += cost
 
 	if accountID != "" {
 		key := accountID
@@ -164,26 +208,37 @@ func Record(model string, success bool, durationMs int64, accountID string) {
 
 // Snapshot returns a deep-copy view with percentiles computed.
 type Snapshot struct {
-	StartedAt     int64                      `json:"startedAt"`
-	TotalRequests int                        `json:"totalRequests"`
-	SuccessCount  int                        `json:"successCount"`
-	ErrorCount    int                        `json:"errorCount"`
-	ModelCounts   map[string]*ModelCounts    `json:"modelCounts"`
-	AccountCounts map[string]*AccountCounts  `json:"accountCounts"`
-	HourlyBuckets []HourBucket               `json:"hourlyBuckets"`
+	StartedAt         int64                     `json:"startedAt"`
+	TotalRequests     int                       `json:"totalRequests"`
+	SuccessCount      int                       `json:"successCount"`
+	ErrorCount        int                       `json:"errorCount"`
+	TotalInputTokens  int64                     `json:"totalInputTokens"`
+	TotalOutputTokens int64                     `json:"totalOutputTokens"`
+	TotalCostUSD      float64                   `json:"totalCostUsd"`
+	UpstreamStatus    map[string]int            `json:"upstreamStatus"`
+	ModelCounts       map[string]*ModelCounts   `json:"modelCounts"`
+	AccountCounts     map[string]*AccountCounts `json:"accountCounts"`
+	HourlyBuckets     []HourBucket              `json:"hourlyBuckets"`
 }
 
 func Get() Snapshot {
 	mu.Lock()
 	defer mu.Unlock()
 	s := Snapshot{
-		StartedAt:     state.StartedAt,
-		TotalRequests: state.TotalRequests,
-		SuccessCount:  state.SuccessCount,
-		ErrorCount:    state.ErrorCount,
-		HourlyBuckets: append([]HourBucket(nil), state.HourlyBuckets...),
-		ModelCounts:   map[string]*ModelCounts{},
-		AccountCounts: map[string]*AccountCounts{},
+		StartedAt:         state.StartedAt,
+		TotalRequests:     state.TotalRequests,
+		SuccessCount:      state.SuccessCount,
+		ErrorCount:        state.ErrorCount,
+		TotalInputTokens:  state.TotalInputTokens,
+		TotalOutputTokens: state.TotalOutputTokens,
+		TotalCostUSD:      state.TotalCostUSD,
+		UpstreamStatus:    map[string]int{},
+		HourlyBuckets:     append([]HourBucket(nil), state.HourlyBuckets...),
+		ModelCounts:       map[string]*ModelCounts{},
+		AccountCounts:     map[string]*AccountCounts{},
+	}
+	for k, v := range state.UpstreamStatus {
+		s.UpstreamStatus[k] = v
 	}
 	for k, v := range state.ModelCounts {
 		sorted := append([]int64(nil), v.recent...)
@@ -219,9 +274,10 @@ func Reset() {
 	mu.Lock()
 	defer mu.Unlock()
 	state = internalState{
-		StartedAt:     time.Now().UnixMilli(),
-		ModelCounts:   map[string]*ModelCounts{},
-		AccountCounts: map[string]*AccountCounts{},
+		StartedAt:      time.Now().UnixMilli(),
+		UpstreamStatus: map[string]int{},
+		ModelCounts:    map[string]*ModelCounts{},
+		AccountCounts:  map[string]*AccountCounts{},
 	}
 	scheduleSave()
 }

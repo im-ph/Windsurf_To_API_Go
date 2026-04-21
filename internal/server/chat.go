@@ -247,7 +247,7 @@ func (d *Deps) nonStreamChat(w http.ResponseWriter, r *http.Request, in streamIn
 	// Cache hit.
 	if v, ok := cache.Get(in.CacheKey); ok {
 		logx.Info("Chat: cache HIT model=%s flow=non-stream", in.DisplayModel)
-		stats.Record(in.DisplayModel, true, 0, "")
+		stats.Record(in.DisplayModel, true, 0, "", 0, 0, 200)
 		writeJSON(w, http.StatusOK, nonStreamBody(in, v.Text, v.Thinking, nil, nil, "stop", true))
 		return
 	}
@@ -346,7 +346,14 @@ func (d *Deps) nonStreamChat(w http.ResponseWriter, r *http.Request, in streamIn
 
 		d.Pool.ReportSuccess(acct.APIKey)
 		d.Pool.UpdateCapability(acct.APIKey, in.ModelKey, true, "success")
-		stats.Record(in.DisplayModel, true, time.Since(time.Unix(in.Created, 0)).Milliseconds(), acct.APIKey)
+		var inTok, outTok int64
+		if res.Usage != nil {
+			inTok = int64(res.Usage.PromptTokens)
+			outTok = int64(res.Usage.CompletionTokens)
+		}
+		stats.Record(in.DisplayModel, true,
+			time.Since(time.Unix(in.Created, 0)).Milliseconds(),
+			acct.APIKey, inTok, outTok, 200)
 
 		if reuseEnabled && res.CascadeID != "" && res.Text != "" {
 			fpAfter := convpool.FingerprintAfter(convMessagesFromClient(in.CascadeMsgs), res.Text)
@@ -369,7 +376,13 @@ func (d *Deps) nonStreamChat(w http.ResponseWriter, r *http.Request, in streamIn
 	}
 
 	// ── Retry exhausted ──
-	stats.Record(in.DisplayModel, false, time.Since(time.Unix(in.Created, 0)).Milliseconds(), "")
+	var lastStatus int
+	if last != nil {
+		lastStatus = last.status
+	}
+	stats.Record(in.DisplayModel, false,
+		time.Since(time.Unix(in.Created, 0)).Milliseconds(),
+		"", 0, 0, lastStatus)
 	if last == nil {
 		if all, retry := d.Pool.IsAllRateLimited(in.ModelKey); all {
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", retry/1000+1))
@@ -594,7 +607,7 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 	// Cache replay path.
 	if v, ok := cache.Get(in.CacheKey); ok {
 		logx.Info("Chat: cache HIT model=%s flow=stream", in.DisplayModel)
-		stats.Record(in.DisplayModel, true, 0, "")
+		stats.Record(in.DisplayModel, true, 0, "", 0, 0, 200)
 		send(chunkRole(in))
 		if v.Thinking != "" {
 			send(chunkThinking(in, v.Thinking))
@@ -793,7 +806,6 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 			d.Pool.ReportSuccess(acct.APIKey)
 		}
 		d.Pool.UpdateCapability(acct.APIKey, in.ModelKey, true, "success")
-		stats.Record(in.DisplayModel, true, time.Since(start).Milliseconds(), acct.APIKey)
 
 		if !rolePrinted {
 			send(chunkRole(in))
@@ -808,6 +820,14 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 		} else {
 			usage = buildUsageFromCascade(nil, in.LegacyMsgs, accText.String(), "")
 		}
+		// Record after usage is computed so we get real token counts.
+		var inTok, outTok int64
+		if usage != nil {
+			inTok = int64(usage.PromptTokens)
+			outTok = int64(usage.CompletionTokens)
+		}
+		stats.Record(in.DisplayModel, true, time.Since(start).Milliseconds(),
+			acct.APIKey, inTok, outTok, 200)
 		send(chunkFinish(in, finish, usage))
 		// include_usage-style terminal chunk
 		send(map[string]any{
@@ -823,8 +843,11 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 		return
 	}
 
-	// All attempts failed.
-	stats.Record(in.DisplayModel, false, time.Since(start).Milliseconds(), curAPIKey)
+	// All attempts failed. lastErr is plain `error` here (not *chatErr), so
+	// we can't extract an upstream status — record with 0 to land in the
+	// "transport / unknown" bucket on the dashboard.
+	stats.Record(in.DisplayModel, false, time.Since(start).Milliseconds(),
+		curAPIKey, 0, 0, 0)
 	if !rolePrinted {
 		send(chunkRole(in))
 	}

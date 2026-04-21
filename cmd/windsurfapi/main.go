@@ -111,15 +111,29 @@ func main() {
 	resolve := server.ProxyResolver()
 	probe := deps.MakeProbeFunc()
 	stopPeriodic := pool.Periodic(rootCtx, resolve, probe)
-	go pool.FetchModelCatalog(resolve)
+	// Kick off the first fetch immediately, then refresh every 2h so newly
+	// released cloud models land without a restart.
+	go func() {
+		pool.FetchModelCatalog(resolve)
+		t := time.NewTicker(2 * time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case <-t.C:
+				pool.FetchModelCatalog(resolve)
+			}
+		}
+	}()
 
 	srv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.Port),
+		Addr:              fmt.Sprintf("%s:%d", cfg.BindHost, cfg.Port),
 		Handler:           server.Handler(deps),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	logx.Info("Server on http://0.0.0.0:%d", cfg.Port)
+	logx.Info("Server on http://%s:%d", cfg.BindHost, cfg.Port)
 	logx.Info("  POST /v1/chat/completions  (OpenAI compatible)")
 	logx.Info("  POST /v1/messages          (Anthropic compatible)")
 	logx.Info("  GET  /v1/models")

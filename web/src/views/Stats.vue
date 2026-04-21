@@ -7,6 +7,7 @@ import MetricCard from '@/components/MetricCard.vue';
 import { getStats, resetStats } from '@/api/stats';
 import type { StatsPayload } from '@/api/types';
 import { toast } from '@/api/request';
+import { displayModelName } from '@/utils/modelName';
 
 const loading = ref(true);
 const data = ref<StatsPayload | null>(null);
@@ -73,8 +74,9 @@ const modelColumns = [
 
 const modelRows = computed(() =>
   Object.entries(data.value?.modelCounts ?? {})
-    .map(([model, v]) => ({
-      model,
+    .map(([id, v]) => ({
+      model: displayModelName(id),
+      modelId: id,
       requests: v.requests,
       success: v.success,
       errors: v.errors,
@@ -198,7 +200,7 @@ onUnmounted(() => {
         :data-source="modelRows"
         :columns="modelColumns"
         :pagination="false"
-        row-key="model"
+        row-key="modelId"
         size="middle"
       />
     </Card>

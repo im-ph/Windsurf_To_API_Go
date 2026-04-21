@@ -44,6 +44,38 @@ export interface CacheSnapshot {
   hitRate: string;
 }
 
+export interface SystemSnapshot {
+  os: string;
+  cpu: { percent: number; cores: number };
+  memory: {
+    totalBytes: number;
+    usedBytes: number;
+    availableBytes: number;
+    percent: number;
+  };
+  swap: { totalBytes: number; usedBytes: number; percent: number };
+  network: {
+    rxBytesPerSec: number;
+    txBytesPerSec: number;
+    rxBytesTotal: number;
+    txBytesTotal: number;
+  };
+  load: { min1: number; min5: number; min15: number };
+}
+
+export interface TokenTotals {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+}
+
+export interface ModelAccessSummary {
+  total: number;
+  allowed: number;
+  mode: ModelAccessMode;
+}
+
 export interface OverviewPayload {
   uptime: number;
   startedAt: number;
@@ -55,6 +87,12 @@ export interface OverviewPayload {
   errorCount: number;
   successRate: string;
   cache: CacheSnapshot;
+  system: SystemSnapshot;
+  tokens: TokenTotals;
+  // Histogram of upstream HTTP status codes. "0" = transport/no-status bucket.
+  upstreamStatus: Record<string, number>;
+  modelAccess: ModelAccessSummary;
+  version: string;
 }
 
 export type AccountTier = 'pro' | 'free' | 'expired' | 'unknown' | '';
@@ -147,6 +185,24 @@ export interface ModelInfo {
   id: string;
   name: string;
   provider: string;
+}
+
+export interface CatalogModel {
+  id: string;
+  name: string;
+  display: string;
+  score: number;
+}
+
+export interface CatalogGroup {
+  name: string;
+  count: number;
+  topScore: number;
+  models: CatalogModel[];
+}
+
+export interface CatalogResponse {
+  groups: CatalogGroup[];
 }
 
 export type ModelAccessMode = 'all' | 'allowlist' | 'blocklist';

@@ -7,6 +7,7 @@ import MetricCard from '@/components/MetricCard.vue';
 import { listAccounts, patchAccount } from '@/api/accounts';
 import type { AccountRow } from '@/api/types';
 import { toast } from '@/api/request';
+import { displayModelName } from '@/utils/modelName';
 
 const accounts = ref<AccountRow[]>([]);
 const loading = ref(false);
@@ -87,6 +88,25 @@ function statusColor(status: string): string {
       return 'default';
     default:
       return 'default';
+  }
+}
+
+// Tier enum → display label. Backend stores tiers lower-case ("pro", "free")
+// but the dashboard shows them title-cased so the operator doesn't read raw
+// API strings in a column.
+function tierLabel(tier: string): string {
+  if (!tier) return '—';
+  switch (tier.toLowerCase()) {
+    case 'pro':
+      return 'Pro';
+    case 'free':
+      return 'Free';
+    case 'expired':
+      return 'Expired';
+    case 'unknown':
+      return 'Unknown';
+    default:
+      return tier.charAt(0).toUpperCase() + tier.slice(1).toLowerCase();
   }
 }
 
@@ -229,6 +249,9 @@ const columns = [
         <template v-if="column.dataIndex === 'status'">
           <Tag :color="displayStatus(record).color">{{ displayStatus(record).label }}</Tag>
         </template>
+        <template v-else-if="column.dataIndex === 'tier'">
+          {{ tierLabel(record.tier) }}
+        </template>
         <template v-else-if="column.dataIndex === 'rateLimited'">
           <Tag v-if="record.rateLimited" color="warning">
             <ThunderboltOutlined />
@@ -244,7 +267,7 @@ const columns = [
             <div v-for="(e, i) in rateEntries(record)" :key="i" class="rate-pill">
               <ThunderboltOutlined class="rate-icon" />
               <span v-if="e.kind === 'account'" class="rate-scope account">全账号</span>
-              <code v-else class="rate-scope model">{{ e.model }}</code>
+              <code v-else class="rate-scope model">{{ displayModelName(e.model ?? '') }}</code>
               <span class="rate-count">{{ countdown(e.until) }}</span>
             </div>
           </div>
@@ -259,7 +282,7 @@ const columns = [
             <div class="rate-note">
               <div v-for="(e, i) in rateEntries(record)" :key="i">
                 <template v-if="e.kind === 'model'">
-                  <code>{{ e.model }}</code> 被官方限速，
+                  <code>{{ displayModelName(e.model ?? '') }}</code> 被官方限速，
                   <span v-if="e.started" class="when">
                     北京时间 {{ fmtBeijing(e.started) }}
                   </span>

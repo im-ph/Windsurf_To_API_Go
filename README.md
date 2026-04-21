@@ -1,12 +1,14 @@
 # WindsurfAPI · Go 重写版
 
+> **使用边界**：本项目仅供个人学习、研究与自用。**严禁商业转售、对外中转、付费部署、"共享账号"式代理服务**或任何以本软件为基础的营利性运营。违反者与维护者无关，出现的后果自负。底部的 MIT 条款只是开源协议形态，并不解除上述使用边界。
+
 将 Windsurf 的官方 Language Server 封装为 OpenAI / Anthropic 兼容的单文件反向代理，自带管理控制台。零运行时依赖，除同目录下的 `language_server_linux_x64` 外无需额外文件。
 
-- **语言 / 运行时**：Go ≥ 1.26.2，静态编译，Linux amd64 产物约 9 MB
+- **语言 / 运行时**：Go ≥ 1.26.2，静态编译，Linux amd64 产物约 13 MB（含内嵌 Vue SPA）
 - **内嵌前端**：Vue 3 + TypeScript + Ant Design Vue 4，`//go:embed` 打入二进制
 - **兼容协议**：OpenAI `/v1/chat/completions` + Anthropic `/v1/messages`（原生 SSE 透传）
 - **账号池**：分层 RPM 加权调度、按模型级别的限速/限流隔离、Firebase 令牌自动刷新
-- **控制台**：9 个页面（仪表盘 / 统计分析 / 登录取号 / 账号管理 / 异常监测 / 模型控制 / 代理配置 / 运行日志 / 实验性功能）
+- **控制台**：9 个页面（仪表盘 / 统计分析 / 登录取号 / 账号管理 / 异常监测 / 模型控制 / 代理配置 / 运行日志 / 实验性功能），支持实时系统指标、模型能力清单、Token 消耗与等价费用统计
 
 ## 快速开始
 
@@ -58,13 +60,14 @@ Windsurf_To_API_Go/
 │   ├── langserver/               Language Server 进程池（一代理一实例）
 │   ├── logx/                     环形缓冲 + SSE 广播 + JSONL 日志滚动
 │   ├── modelaccess/              全局模型白/黑名单
-│   ├── models/                   模型目录（120+ 条）+ 层级访问表
+│   ├── models/                   模型目录（120+ 条）+ 层级访问表 + 能力评分 + 定价表
 │   ├── pbenc/                    零依赖 protobuf 编解码
 │   ├── proxycfg/                 全局 + 账号级 HTTP/HTTPS/SOCKS5 代理
 │   ├── runtimecfg/               运行时配置（实验性开关 + 身份提示模板）
 │   ├── sanitize/                 流式路径脱敏（/tmp/windsurf-workspace）
 │   ├── server/                   HTTP 路由 + chat / messages / 探测
-│   ├── stats/                    每模型 / 每账号 / 72h 桶 + p50/p95
+│   ├── stats/                    每模型 / 每账号 / 72h 桶 + p50/p95 + Token 消耗 + USD 等价费用
+│   ├── sysinfo/                  实时系统指标采样（/proc 读取，CPU/内存/SWAP/网络/负载）
 │   ├── toolemu/                  OpenAI tools[] ↔ Cascade 文本协议模拟
 │   ├── web/                      内嵌前端（Vite 构建产物 + //go:embed）
 │   └── windsurf/                 Cascade + Legacy 协议 builder/parser
@@ -85,6 +88,18 @@ Windsurf_To_API_Go/
 ├── .env.example                  环境变量模板
 └── docs/                         完整文档
 ```
+
+## 控制台亮点
+
+- **仪表盘（Overview）**：活跃账号 / 总请求 / 运行时间 / LS 状态 / 响应缓存 + **实时系统指标**（CPU、内存、SWAP、下行/上行带宽、系统负载 1/5/15）+ **Token 消耗**（输入/输出/总量）+ **等价总费用**（按各家官方公开定价折算）+ 可用模型数 + 版本号；底部新开"模型清单"框，按厂商分组（Claude / GPT / Gemini / Kimi / GLM / …），每个模型显示能力总分，长名称鼠标悬停时自动左滑展示完整 ID；底部还附上游 HTTP 状态码直方图（2xx/4xx/5xx/传输错误按色分）
+- **统计分析**：按小时粒度（6h / 24h / 72h 可切）的请求量柱图、模型维度与账号维度表（p50 / p95 / 错误率），模型名显示为人类可读格式（`Claude Opus 4.6 Thinking`）
+- **登录取号**：Firebase 邮箱密码 + Google / GitHub OAuth（OAuth 仅在 `windsurf.com` / `localhost` 来源下可用）；支持一次批量取号，成功 / 失败都入库
+- **账号管理**：36+ 账号的分页视图，手动层级覆盖（"Free 试用用户被识别为 Pro"的兜底）、主动能力探测、日 / 周额度剩余百分比按色显示、限流状态可视
+- **异常监测**：全账号按严重度排序，展示限流与**限速**（per-model 窗口），附"北京时间 HH:mm 开始 — 北京时间 HH:mm 解除"原因说明，到期自动放回号池
+- **模型控制**：全局允许 / 封锁清单、访问模式三档切换
+- **代理配置**：全局 + 账号级 HTTP/HTTPS/SOCKS5，支持在主机字段直接贴 `host:port`，代理测试返回出口 IP + 延迟
+- **运行日志**：SSE 实时流 + 级别筛选 + 关键字搜索，填满视口高度
+- **实验性功能**：`cascadeConversationReuse` / `modelIdentityPrompt` / `preflightRateLimit` 等开关可以界面切换
 
 ## 性能与 JS 版对比
 

@@ -31,6 +31,7 @@ import (
 	"windsurfapi/internal/modelaccess"
 	"windsurfapi/internal/models"
 	"windsurfapi/internal/proxycfg"
+	"windsurfapi/internal/sysinfo"
 	"windsurfapi/internal/runtimecfg"
 	"windsurfapi/internal/stats"
 )
@@ -272,6 +273,9 @@ func (d *Deps) route(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"models": out})
 
+	case sub == "/models/catalog" && r.Method == http.MethodGet:
+		d.modelsCatalog(w)
+
 	case sub == "/model-access" && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, modelaccess.Get())
 	case sub == "/model-access" && r.Method == http.MethodPut:
@@ -317,6 +321,66 @@ func (d *Deps) route(w http.ResponseWriter, r *http.Request) {
 
 // ─── Handlers (one per route group) ──────────────────────
 
+// modelsCatalog returns the full catalog grouped by vendor family with a
+// hand-curated capability score per model. The dashboard overview card uses
+// this to render the "模型清单" panel; no caching needed since the catalog is
+// static and the grouping cost is trivial.
+func (d *Deps) modelsCatalog(w http.ResponseWriter) {
+	type modelRow struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Display string `json:"display"`
+		Score   int    `json:"score"`
+	}
+	type group struct {
+		Name     string     `json:"name"`
+		Count    int        `json:"count"`
+		TopScore int        `json:"topScore"`
+		Models   []modelRow `json:"models"`
+	}
+	buckets := map[string][]modelRow{}
+	for _, k := range models.AllKeys() {
+		info := models.Get(k)
+		if info == nil {
+			continue
+		}
+		fam := models.Family(k)
+		buckets[fam] = append(buckets[fam], modelRow{
+			ID:      k,
+			Name:    info.Name,
+			Display: models.DisplayName(k),
+			Score:   models.Score(k),
+		})
+	}
+	out := make([]group, 0, len(buckets))
+	for name, rows := range buckets {
+		// Sort models by score desc, then by display name.
+		for i := 0; i < len(rows); i++ {
+			for j := i + 1; j < len(rows); j++ {
+				if rows[j].Score > rows[i].Score ||
+					(rows[j].Score == rows[i].Score && rows[j].Display < rows[i].Display) {
+					rows[i], rows[j] = rows[j], rows[i]
+				}
+			}
+		}
+		top := 0
+		if len(rows) > 0 {
+			top = rows[0].Score
+		}
+		out = append(out, group{Name: name, Count: len(rows), TopScore: top, Models: rows})
+	}
+	// Groups sorted by top score desc, then by name.
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].TopScore > out[i].TopScore ||
+				(out[j].TopScore == out[i].TopScore && out[j].Name < out[i].Name) {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"groups": out})
+}
+
 func (d *Deps) overview(w http.ResponseWriter) {
 	s := stats.Get()
 	rate := "0.0"
@@ -324,17 +388,48 @@ func (d *Deps) overview(w http.ResponseWriter) {
 		v := float64(s.SuccessCount) / float64(s.TotalRequests) * 100
 		rate = fmt.Sprintf("%.1f", v)
 	}
+	// Available model count = keys passing the global model-access policy.
+	// Computed against the full catalog, not per-tier — the card reflects
+	// operator-side gating rather than account-tier access.
+	mcfg := modelaccess.Get()
+	allKeys := models.AllKeys()
+	allowed := 0
+	for _, k := range allKeys {
+		if modelaccess.Check(k).Allowed {
+			allowed++
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"uptime":         int64(time.Since(time.UnixMilli(s.StartedAt)).Seconds()),
-		"startedAt":      s.StartedAt,
-		"accounts":       d.Pool.Counts(),
-		"authenticated":  d.Pool.IsAuthenticated(),
-		"langServer":     d.LSP.Snapshot(),
-		"totalRequests":  s.TotalRequests,
-		"successCount":   s.SuccessCount,
-		"errorCount":     s.ErrorCount,
-		"successRate":    rate,
-		"cache":          cache.Snapshot(),
+		"uptime":        int64(time.Since(time.UnixMilli(s.StartedAt)).Seconds()),
+		"startedAt":     s.StartedAt,
+		"accounts":      d.Pool.Counts(),
+		"authenticated": d.Pool.IsAuthenticated(),
+		"langServer":    d.LSP.Snapshot(),
+		"totalRequests": s.TotalRequests,
+		"successCount":  s.SuccessCount,
+		"errorCount":    s.ErrorCount,
+		"successRate":   rate,
+		"cache":         cache.Snapshot(),
+		// Live OS metrics (CPU / mem / swap / network / load).
+		"system": sysinfo.Get(),
+		// Aggregate token accounting + USD equivalent.
+		"tokens": map[string]any{
+			"inputTokens":  s.TotalInputTokens,
+			"outputTokens": s.TotalOutputTokens,
+			"totalTokens":  s.TotalInputTokens + s.TotalOutputTokens,
+			"costUsd":      s.TotalCostUSD,
+		},
+		// Upstream HTTP status code histogram — {"200": 123, "429": 5, "0": 2, ...}
+		"upstreamStatus": s.UpstreamStatus,
+		// Overall model access snapshot for the dashboard header card.
+		"modelAccess": map[string]any{
+			"total":   len(allKeys),
+			"allowed": allowed,
+			"mode":    mcfg.Mode,
+		},
+		// Service version string surfaced by /health — repeated here so the
+		// overview page can render a "version" card without a second round-trip.
+		"version": "1.2.0-go",
 	})
 }
 

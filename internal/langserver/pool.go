@@ -203,6 +203,39 @@ func (p *Pool) Ensure(ctx context.Context, px *Proxy) (*Entry, error) {
 		e := &Entry{Port: port, CSRF: DefaultCSRF, StartedAt: time.Now(), Ready: true, SessionID: windsurf.NewSessionID()}
 		p.entries[key] = e
 		p.mu.Unlock()
+		// Watchdog — adopted entries have no Process ref, so there's no
+		// cmd.Wait() goroutine to clean them up. Poll the port every 5s; if
+		// it goes silent for two consecutive checks, purge the stale entry
+		// so the next request re-runs Ensure and spawns a fresh LS instead
+		// of dialling a dead port forever.
+		go func(k string, port int, adopted *Entry) {
+			misses := 0
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for range t.C {
+				p.mu.Lock()
+				cur, ok := p.entries[k]
+				p.mu.Unlock()
+				if !ok || cur != adopted {
+					return // superseded (spawned/restarted) — watchdog is done
+				}
+				if isPortInUse(port) {
+					misses = 0
+					continue
+				}
+				misses++
+				if misses >= 2 {
+					p.mu.Lock()
+					if p.entries[k] == adopted {
+						delete(p.entries, k)
+						logx.Warn("LS adopted instance %s port %d went silent — purging so next request respawns", k, port)
+					}
+					p.mu.Unlock()
+					convpool.InvalidateFor("", port)
+					return
+				}
+			}
+		}(key, port, e)
 		return e, nil
 	}
 	p.mu.Unlock()
