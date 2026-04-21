@@ -1,5 +1,26 @@
-// Package cache is an exact-body LRU response cache keyed on the request's
-// semantically meaningful fields. Mirrors src/cache.js.
+// Package cache is a disk-backed LRU response cache. Keys are SHA-256
+// hashes of the normalised request body; each Entry's Text+Thinking is
+// written to its own file, not held in Go heap memory.
+//
+// Storage strategy — why disk, not RAM:
+//
+// The service runs on a small VM (≤1 GB RAM typical). With maxItems=6000
+// and typical text around 2-6 KB per response, a purely in-RAM cache can
+// grow to 10-30 MB and fight the account pool / LS process for memory.
+// Pushing the cache to disk moves that pressure off the Go heap entirely:
+//
+//   - Path defaults to /tmp/windsurfapi-cache/ — on systemd Debian, /tmp is
+//     tmpfs (backed by swap). Entries live in RAM while memory is cheap,
+//     but the kernel transparently pages cold files out to swap under
+//     pressure. Net effect: "cache lives in SWAP" as requested.
+//   - Setting CACHE_PATH to a regular-disk directory (e.g. /opt/…/cache)
+//     instead puts the cache on persistent disk — it survives restarts
+//     and the OS page cache + swap handle memory pressure for free.
+//
+// RAM footprint of the in-process bookkeeping:
+//
+//   per entry:  64-char hex key + filepath + expiresAt + list node ≈ 200 B
+//   6000 entries × 200 B ≈ 1.2 MB — negligible.
 package cache
 
 import (
@@ -7,27 +28,34 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+// Defaults — overridden by Init() when called with non-empty args.
 const (
-	ttl      = 5 * time.Minute
-	maxItems = 500
+	defaultTTL      = 2 * time.Hour
+	defaultMaxItems = 6000
+	defaultDir      = "/tmp/windsurfapi-cache"
 )
 
 // Entry is what callers read/write. Text + Thinking are the only replay
 // channels today.
 type Entry struct {
-	Text     string
-	Thinking string
+	Text     string `json:"text"`
+	Thinking string `json:"thinking,omitempty"`
 }
 
+// record is the in-RAM bookkeeping. The *value* is NOT held here — Get
+// reads from the file when the caller asks.
 type record struct {
 	key       string
-	value     Entry
 	expiresAt time.Time
+	sizeBytes int
 }
 
 // Stats is a snapshot for the dashboard.
@@ -40,6 +68,10 @@ type Stats struct {
 	Stores     uint64 `json:"stores"`
 	Evictions  uint64 `json:"evictions"`
 	HitRatePct string `json:"hitRate"`
+	// Backing path + resident byte count — handy when debugging "where is
+	// my cache actually living" questions from the dashboard.
+	Backing    string `json:"backing"`
+	BytesOnDisk int64 `json:"bytesOnDisk"`
 }
 
 var (
@@ -47,8 +79,35 @@ var (
 	order = list.New()
 	idx   = map[string]*list.Element{}
 
+	ttl        = defaultTTL
+	maxItems   = defaultMaxItems
+	dir        = defaultDir
+	bytesOnDisk int64
+
 	hits, misses, stores, evictions uint64
 )
+
+// Init configures the cache. Safe to call from main() before first use.
+// Pass zero / empty to keep defaults. Missing backing dir is created with
+// 0o700 so only the service user can read pooled cache bodies.
+func Init(cacheDir string, maxEntries int, entryTTL time.Duration) {
+	mu.Lock()
+	defer mu.Unlock()
+	if cacheDir != "" {
+		dir = cacheDir
+	}
+	if maxEntries > 0 {
+		maxItems = maxEntries
+	}
+	if entryTTL > 0 {
+		ttl = entryTTL
+	}
+	_ = os.MkdirAll(dir, 0o700)
+	// Reload whatever is still on disk — cache survives restart on
+	// persistent-disk backings, and on tmpfs it at least survives within
+	// the same uptime when we happen to bounce the service.
+	reloadFromDisk()
+}
 
 // KeyFromRequest hashes the subset of the request body that actually changes
 // semantic output — matches src/cache.js normalize().
@@ -68,25 +127,47 @@ func Key(body RequestBody) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Get returns a non-expired entry and refreshes its LRU position.
+// Get returns a non-expired entry and refreshes its LRU position. The value
+// is read from disk on the fly — cheap enough for tmpfs / SSD and avoids
+// pinning response bodies in the Go heap.
 func Get(k string) (Entry, bool) {
 	mu.Lock()
-	defer mu.Unlock()
 	el, ok := idx[k]
 	if !ok {
+		mu.Unlock()
 		atomic.AddUint64(&misses, 1)
 		return Entry{}, false
 	}
 	r := el.Value.(*record)
 	if time.Now().After(r.expiresAt) {
-		order.Remove(el)
-		delete(idx, k)
+		removeLocked(el, r)
+		mu.Unlock()
 		atomic.AddUint64(&misses, 1)
 		return Entry{}, false
 	}
 	order.MoveToBack(el)
+	path := pathFor(r.key)
+	mu.Unlock()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		// File disappeared under us (evicted by another goroutine,
+		// manually cleared, or tmpfs truncated). Treat as miss.
+		mu.Lock()
+		if el2, ok := idx[k]; ok && el2 == el {
+			removeLocked(el, r)
+		}
+		mu.Unlock()
+		atomic.AddUint64(&misses, 1)
+		return Entry{}, false
+	}
+	var e Entry
+	if json.Unmarshal(raw, &e) != nil {
+		atomic.AddUint64(&misses, 1)
+		return Entry{}, false
+	}
 	atomic.AddUint64(&hits, 1)
-	return r.value, true
+	return e, true
 }
 
 // Set replaces or inserts an entry; evicts oldest when over capacity.
@@ -94,35 +175,66 @@ func Set(k string, v Entry) {
 	if v.Text == "" && v.Thinking == "" {
 		return
 	}
+	blob, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	path := pathFor(k)
+	// Atomic write so a concurrent Get never sees a torn file.
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, blob, 0o600); err != nil {
+		return
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
 	if el, ok := idx[k]; ok {
 		r := el.Value.(*record)
-		r.value = v
+		atomic.AddInt64(&bytesOnDisk, int64(len(blob)-r.sizeBytes))
 		r.expiresAt = time.Now().Add(ttl)
+		r.sizeBytes = len(blob)
 		order.MoveToBack(el)
 		return
 	}
-	r := &record{key: k, value: v, expiresAt: time.Now().Add(ttl)}
+	r := &record{key: k, expiresAt: time.Now().Add(ttl), sizeBytes: len(blob)}
 	el := order.PushBack(r)
 	idx[k] = el
+	atomic.AddInt64(&bytesOnDisk, int64(len(blob)))
 	atomic.AddUint64(&stores, 1)
 	for order.Len() > maxItems {
 		front := order.Front()
 		if front == nil {
 			break
 		}
-		order.Remove(front)
-		delete(idx, front.Value.(*record).key)
+		fr := front.Value.(*record)
+		removeLocked(front, fr)
 		atomic.AddUint64(&evictions, 1)
 	}
 }
 
-// Clear wipes everything.
+// removeLocked deletes the LRU node, the index entry, and the backing file.
+// Caller holds mu.
+func removeLocked(el *list.Element, r *record) {
+	order.Remove(el)
+	delete(idx, r.key)
+	atomic.AddInt64(&bytesOnDisk, -int64(r.sizeBytes))
+	_ = os.Remove(pathFor(r.key))
+}
+
+// Clear wipes everything — RAM index + disk files + counters.
 func Clear() {
 	mu.Lock()
 	order.Init()
 	idx = map[string]*list.Element{}
+	atomic.StoreInt64(&bytesOnDisk, 0)
+	// Nuke the whole directory and recreate — simpler than iterating the
+	// LRU list and matching filenames, and drops any orphaned files too.
+	_ = os.RemoveAll(dir)
+	_ = os.MkdirAll(dir, 0o700)
 	mu.Unlock()
 	atomic.StoreUint64(&hits, 0)
 	atomic.StoreUint64(&misses, 0)
@@ -134,6 +246,9 @@ func Clear() {
 func Snapshot() Stats {
 	mu.Lock()
 	size := order.Len()
+	backing := dir
+	maxE := maxItems
+	ttlMs := ttl.Milliseconds()
 	mu.Unlock()
 	h := atomic.LoadUint64(&hits)
 	m := atomic.LoadUint64(&misses)
@@ -142,12 +257,83 @@ func Snapshot() Stats {
 		rate = fmtFloat(float64(h) / float64(total) * 100)
 	}
 	return Stats{
-		Size: size, MaxSize: maxItems, TTLMs: ttl.Milliseconds(),
+		Size: size, MaxSize: maxE, TTLMs: ttlMs,
 		Hits: h, Misses: m,
-		Stores:    atomic.LoadUint64(&stores),
-		Evictions: atomic.LoadUint64(&evictions),
-		HitRatePct: rate,
+		Stores:      atomic.LoadUint64(&stores),
+		Evictions:   atomic.LoadUint64(&evictions),
+		HitRatePct:  rate,
+		Backing:     backing,
+		BytesOnDisk: atomic.LoadInt64(&bytesOnDisk),
 	}
+}
+
+// pathFor returns the file path for a cache key. The key is a 64-char hex
+// SHA-256, safe to drop directly into the filename with no escaping.
+func pathFor(k string) string {
+	return filepath.Join(dir, k+".json")
+}
+
+// reloadFromDisk rehydrates the in-RAM index from whatever files are in
+// the backing dir. Entries whose files are unreadable or already expired
+// (by mtime + ttl) are purged. Caller holds mu.
+func reloadFromDisk() {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !hasSuffix(name, ".json") {
+			continue
+		}
+		// Skip .tmp / crash residue.
+		if hasSuffix(name, ".tmp.json") || hasSuffix(name, ".tmp") {
+			continue
+		}
+		key := name[:len(name)-len(".json")]
+		if len(key) != 64 {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		expires := info.ModTime().Add(ttl)
+		if now.After(expires) {
+			_ = os.Remove(filepath.Join(dir, name))
+			continue
+		}
+		if _, ok := idx[key]; ok {
+			continue
+		}
+		r := &record{key: key, expiresAt: expires, sizeBytes: int(info.Size())}
+		el := order.PushBack(r)
+		idx[key] = el
+		atomic.AddInt64(&bytesOnDisk, info.Size())
+		if order.Len() >= maxItems {
+			// Don't overshoot on reload — anything beyond cap gets dropped.
+			break
+		}
+	}
+	// If the dir somehow holds a phantom ".tmp" from a mid-write crash,
+	// clean that up too so it doesn't linger.
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		if hasSuffix(e.Name(), ".tmp") {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
+	_ = errors.New // keep errors import stable if future probes need it
+}
+
+func hasSuffix(s, suf string) bool {
+	return len(s) >= len(suf) && s[len(s)-len(suf):] == suf
 }
 
 func fmtFloat(f float64) string {

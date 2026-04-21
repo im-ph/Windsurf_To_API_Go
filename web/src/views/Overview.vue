@@ -146,6 +146,48 @@ function usageTone(p: number | undefined): 'default' | 'success' | 'warning' | '
   return 'success';
 }
 
+// 上游 HTTP 状态码 → 中文原因短语。只列出真正从 Windsurf 上游观测到的代码；
+// 范围兜底按 4xx/5xx 类别给一个通用标签，避免 dashboard 上出现一串裸数字。
+const statusReason: Record<string, string> = {
+  '0': '传输错误',
+  '200': '正常',
+  '201': '已创建',
+  '204': '无内容',
+  '301': '永久重定向',
+  '302': '临时重定向',
+  '304': '未修改',
+  '400': '请求错误',
+  '401': '未授权',
+  '403': '拒绝访问',
+  '404': '未找到',
+  '408': '请求超时',
+  '409': '资源冲突',
+  '413': '负载过大',
+  '422': '参数无效',
+  '429': '限流',
+  '499': '客户端中断',
+  '500': '上游内部错误',
+  '501': '未实现',
+  '502': '网关错误',
+  '503': '服务不可用',
+  '504': '连接超时',
+  '520': 'CDN 未知错误',
+  '521': '上游离线',
+  '522': '连接超时',
+  '524': '上游响应超时',
+};
+
+function reasonFor(code: string): string {
+  if (statusReason[code]) return statusReason[code];
+  const n = Number(code);
+  if (!Number.isFinite(n)) return '未知';
+  if (n >= 200 && n < 300) return '成功';
+  if (n >= 300 && n < 400) return '重定向';
+  if (n >= 400 && n < 500) return '客户端错误';
+  if (n >= 500 && n < 600) return '服务端错误';
+  return '未知';
+}
+
 // Sorted + labelled view of the upstream status code histogram. Success codes
 // (2xx) render green, 4xx amber, 5xx red, "0" (transport) grey.
 interface StatusRow {
@@ -157,10 +199,8 @@ interface StatusRow {
 const statusRows = computed<StatusRow[]>(() => {
   const raw = data.value?.upstreamStatus ?? {};
   const rows: StatusRow[] = Object.entries(raw).map(([code, count]) => {
-    let label = code;
     let tone = 'default';
     if (code === '0') {
-      label = '传输错误';
       tone = 'default';
     } else {
       const n = Number(code);
@@ -169,7 +209,7 @@ const statusRows = computed<StatusRow[]>(() => {
       else if (n >= 400 && n < 500) tone = 'warning';
       else if (n >= 500) tone = 'danger';
     }
-    return { code, count, label, tone };
+    return { code, count, label: reasonFor(code), tone };
   });
   rows.sort((a, b) => b.count - a.count);
   return rows;
@@ -393,7 +433,7 @@ onUnmounted(() => {
         >
           <span class="status-code">{{ row.code === '0' ? '——' : row.code }}</span>
           <span class="status-label">{{ row.label }}</span>
-          <span class="status-count">{{ row.count }}</span>
+          <span class="status-count">{{ row.count }} 次</span>
         </div>
       </div>
     </div>

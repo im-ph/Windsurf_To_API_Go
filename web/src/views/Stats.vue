@@ -61,15 +61,45 @@ const successRate = computed(() => {
   return (((data.value?.successCount ?? 0) / total) * 100).toFixed(1);
 });
 
+// ms 值渲染成 "1.23 s / 456 ms" —— 后端 avgMs/p50Ms/p95Ms 单位都是毫秒，
+// 但裸数字（`1234`）完全看不出量纲；秒级的数据格式化成 s，亚秒级保留 ms。
+function fmtMs(n: number | null | undefined): string {
+  if (n === null || n === undefined || n < 0) return '—';
+  if (!n) return '0 ms';
+  if (n >= 10_000) return `${(n / 1000).toFixed(1)} s`;
+  if (n >= 1_000) return `${(n / 1000).toFixed(2)} s`;
+  return `${Math.round(n)} ms`;
+}
+
+// 延迟列的分位数解释：
+//   中位延迟  = p50，50% 的请求比这个值快
+//   尾部延迟  = p95，仅有 5% 的请求比这个值慢（用来发现拖尾慢请求）
 const modelColumns = [
   { title: '模型', dataIndex: 'model', ellipsis: true },
   { title: '请求', dataIndex: 'requests', width: 80 },
   { title: '成功', dataIndex: 'success', width: 80 },
   { title: '错误', dataIndex: 'errors', width: 80 },
   { title: '成功率', dataIndex: 'rate', width: 90 },
-  { title: '均值', dataIndex: 'avgMs', width: 80 },
-  { title: 'p50', dataIndex: 'p50Ms', width: 80 },
-  { title: 'p95', dataIndex: 'p95Ms', width: 80 },
+  {
+    title: '平均耗时',
+    dataIndex: 'avgMs',
+    width: 110,
+    customRender: ({ value }: { value: number }) => fmtMs(value),
+  },
+  {
+    title: '中位延迟',
+    dataIndex: 'p50Ms',
+    width: 110,
+    customHeaderCell: () => ({ title: 'p50 · 50% 的请求不超过此耗时' }),
+    customRender: ({ value }: { value: number }) => fmtMs(value),
+  },
+  {
+    title: '尾部延迟',
+    dataIndex: 'p95Ms',
+    width: 110,
+    customHeaderCell: () => ({ title: 'p95 · 95% 的请求不超过此耗时（反映慢请求）' }),
+    customRender: ({ value }: { value: number }) => fmtMs(value),
+  },
 ];
 
 const modelRows = computed(() =>
@@ -155,8 +185,8 @@ onUnmounted(() => {
       <MetricCard tone="danger" label="错误" :value="data?.errorCount ?? 0" />
       <MetricCard
         label="监控窗口"
-        :value="`${buckets.length}h`"
-        :description="range === 72 ? '最长 72h 滚动窗口' : '1 小时粒度'"
+        :value="`${buckets.length} 小时`"
+        :description="range === 72 ? '最长 72 小时滚动窗口' : '1 小时粒度'"
       />
     </div>
 
@@ -169,9 +199,9 @@ onUnmounted(() => {
           option-type="button"
           button-style="solid"
           :options="[
-            { label: '近 6h', value: 6 },
-            { label: '近 24h', value: 24 },
-            { label: '近 72h', value: 72 },
+            { label: '近 6 小时', value: 6 },
+            { label: '近 24 小时', value: 24 },
+            { label: '近 72 小时', value: 72 },
           ]"
         />
       </template>

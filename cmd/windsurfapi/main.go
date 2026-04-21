@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"windsurfapi/internal/auth"
+	"windsurfapi/internal/cache"
 	"windsurfapi/internal/config"
 	"windsurfapi/internal/langserver"
 	"windsurfapi/internal/logx"
@@ -51,6 +52,11 @@ func main() {
 	modelaccess.Init()
 	proxycfg.Init()
 	stats.Init()
+	// Cache backs onto disk (defaults to /tmp/windsurfapi-cache → tmpfs
+	// on Debian systemd → spills to swap under pressure). Env CACHE_PATH
+	// can redirect to a persistent-disk location if survive-restart matters
+	// more than swap-offload. Zero args = built-in defaults (6000 / 2h).
+	cache.Init(os.Getenv("CACHE_PATH"), 0, 0)
 
 	// 2) wipe Cascade workspace (Linux only)
 	if runtime.GOOS == "linux" {

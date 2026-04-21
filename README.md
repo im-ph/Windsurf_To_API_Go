@@ -49,7 +49,7 @@ Windsurf_To_API_Go/
 ├── cmd/windsurfapi/main.go       程序入口
 ├── internal/
 │   ├── auth/                     账号池（分层 RPM、限流/限速、能力探测）
-│   ├── cache/                    精确响应缓存（按请求体哈希）
+│   ├── cache/                    精确响应缓存（磁盘后端 / 按请求体哈希，默认 /tmp 上 tmpfs → swap 兜底）
 │   ├── client/                   WindsurfClient（Cascade 流程 + 停滞保护）
 │   ├── cloud/                    Codeium REST（GetUserStatus 等）
 │   ├── config/                   .env + 类型化配置

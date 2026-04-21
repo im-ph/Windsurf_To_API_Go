@@ -1,1 +1,0 @@
-import{h as e}from"./index-D0m7NPXG.js";function o(){return e.get("/models")}function c(){return e.get("/models/catalog")}function a(){return e.get("/model-access")}function n(s){return e.put("/model-access",s)}function r(s){return e.post("/model-access/add",{model:s})}function l(s){return e.post("/model-access/remove",{model:s})}export{o as a,r as b,a as g,c as l,n as p,l as r};

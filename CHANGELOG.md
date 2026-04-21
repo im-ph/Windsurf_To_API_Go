@@ -2,6 +2,29 @@
 
 所有有意义的变更都会记录在本文件。版本采用 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.2-go] — 2026-04-22
+
+运行时资源调整与控制台可读性改进。
+
+### 变更
+
+- **响应缓存全面改为磁盘后端**（[`internal/cache/cache.go`](internal/cache/cache.go) 全量重写）
+  - 容量 `500 → 6000` 条，TTL `5 分钟 → 2 小时`
+  - Entry 体（Text + Thinking）写到 `/tmp/windsurfapi-cache/<sha256>.json`，不再驻留 Go heap —— 默认路径是 Debian systemd 的 tmpfs，内存充裕时在 RAM、压力上来时内核自动把冷文件 spill 到 swap，满足"缓存全部写入 SWAP"的部署要求
+  - `CACHE_PATH` 环境变量可改走持久化磁盘（如 `/opt/windsurfapi/cache`），跨重启保留
+  - 原子写（`.tmp` + rename）防撕裂读；启动时扫目录重建索引，过期就地清理；`Clear()` 现在会删 `dir`
+  - 内存占用：新版只保留 key + expiresAt + LRU 节点（约 200 B/条），6000 条索引仅 ~1.2 MB。以 3 KB 平均响应计，磁盘侧 6000 条约 18 MB
+  - `Snapshot()` 新增 `backing`（当前路径）与 `bytesOnDisk`（磁盘占用字节数）
+- **统计分析页 p50 / p95 汉化 + 单位**（[`web/src/views/Stats.vue`](web/src/views/Stats.vue)）
+  - 表头：`p50 → 中位延迟` / `p95 → 尾部延迟` / `均值 → 平均耗时`
+  - 单元格加 ms/s 单位渲染（裸数字 `1234` 改成 `1.23 s`；`456 ms`）
+  - `customHeaderCell` 加了 `title` 悬停提示说明分位数语义
+  - 时间窗口按钮：`近 6h / 24h / 72h` → `近 6 小时 / 24 小时 / 72 小时`；监控窗口卡的 `${buckets.length}h` 也改成 `N 小时`
+- **上游状态码原因汉化**（[`web/src/views/Overview.vue`](web/src/views/Overview.vue)）
+  - chip 格式从"code code count"改成"code · 原因 · N 次"
+  - 新增 `statusReason` 映射表覆盖 20+ 常见码（200 正常 / 429 限流 / 504 连接超时 / 520 CDN 未知错误 / 522 连接超时 / 524 上游响应超时 等）
+  - 未命中映射时按段落兜底（2xx 成功 / 3xx 重定向 / 4xx 客户端错误 / 5xx 服务端错误）
+
 ## [1.3.1-go] — 2026-04-22
 
 上游 JS 仓 (`dwgx/WindsurfAPI`) 近期提交的 backport。对照 78 条 commits 做了能力缺口审计，吸收对 Go 反代有意义的增量。

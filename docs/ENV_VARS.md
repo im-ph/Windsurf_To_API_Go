@@ -43,6 +43,14 @@
 | `DEFAULT_MODEL` | `claude-4.5-sonnet-thinking` | 调用端没传 `model` 字段时使用 |
 | `MAX_TOKENS` | `8192` | 请求里缺 `max_tokens` 时的默认值 |
 
+### 响应缓存
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `CACHE_PATH` | `/tmp/windsurfapi-cache` | 缓存条目落盘目录。默认路径在 Debian systemd 下是 tmpfs，**热条目在 RAM、内存压力下内核自动 spill 到 swap**；若要跨重启保留，改成持久化盘下的路径（例 `/opt/windsurfapi/cache`），由 OS 页缓存 + swap 做兜底 |
+
+缓存硬编码参数：容量 `6000` 条、TTL `2 小时`（需要调整请修改 `internal/cache/cache.go` 常量后重编）。
+
 ## 示例 `.env`
 
 生产最小配置：
