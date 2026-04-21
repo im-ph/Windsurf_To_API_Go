@@ -1,0 +1,1070 @@
+// Chat completions handler — the hot path of the whole service. Mirrors
+// src/handlers/chat.js line-for-line where the behaviour is observable.
+package server
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"windsurfapi/internal/auth"
+	"windsurfapi/internal/cache"
+	"windsurfapi/internal/client"
+	"windsurfapi/internal/cloud"
+	"windsurfapi/internal/convpool"
+	"windsurfapi/internal/logx"
+	"windsurfapi/internal/modelaccess"
+	"windsurfapi/internal/models"
+	"windsurfapi/internal/proxycfg"
+	"windsurfapi/internal/runtimecfg"
+	"windsurfapi/internal/sanitize"
+	"windsurfapi/internal/stats"
+	"windsurfapi/internal/toolemu"
+	"windsurfapi/internal/windsurf"
+)
+
+const (
+	heartbeatMS    = 15 * time.Second
+	queueRetryMS   = time.Second
+	queueMaxWaitMS = 30 * time.Second
+	streamMaxTries = 10
+)
+
+// ChatRequestBody is a permissive decoder — we care about the
+// OpenAI-compatible subset and forward everything else verbatim.
+type ChatRequestBody struct {
+	Model      string              `json:"model"`
+	Stream     bool                `json:"stream"`
+	MaxTokens  *int                `json:"max_tokens,omitempty"`
+	Messages   []toolemu.OAIMessage `json:"messages"`
+	Tools      []toolemu.Tool      `json:"tools,omitempty"`
+	ToolChoice json.RawMessage     `json:"tool_choice,omitempty"`
+}
+
+// ChatCompletions handles POST /v1/chat/completions.
+func (d *Deps) ChatCompletions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errBody("method not allowed", "method_not_allowed"))
+		return
+	}
+	if !d.Pool.IsAuthenticated() {
+		writeJSON(w, http.StatusServiceUnavailable,
+			errBody("No active accounts. POST /auth/login to add accounts.", "auth_error"))
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<20) // 32 MB cap
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody("body read failed", "invalid_request"))
+		return
+	}
+	var body ChatRequestBody
+	if err := json.Unmarshal(raw, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody("Invalid JSON", "invalid_request"))
+		return
+	}
+	if len(body.Messages) == 0 {
+		writeJSON(w, http.StatusBadRequest, errBody("messages must be an array", "invalid_request"))
+		return
+	}
+
+	// Resolve model.
+	wanted := body.Model
+	if wanted == "" {
+		wanted = d.Cfg.DefaultModel
+	}
+	modelKey := models.Resolve(wanted)
+	info := models.Get(modelKey)
+	if info == nil {
+		writeJSON(w, http.StatusBadRequest, errBody("unknown model: "+wanted, "invalid_model"))
+		return
+	}
+	displayModel := info.Name
+	if displayModel == "" {
+		displayModel = modelKey
+	}
+
+	// Global access policy.
+	if dec := modelaccess.Check(modelKey); !dec.Allowed {
+		writeJSON(w, http.StatusForbidden, errBody(dec.Reason, "model_blocked"))
+		return
+	}
+
+	// Fast path: does ANY active account hold entitlement for this model?
+	eligible := false
+	for _, a := range d.Pool.All() {
+		if a.Status != auth.StatusActive {
+			continue
+		}
+		if !models.IsTierAllowed(a.Tier, modelKey) {
+			continue
+		}
+		blocked := false
+		for _, b := range a.BlockedModels {
+			if b == modelKey {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
+		eligible = true
+		break
+	}
+	if !eligible {
+		writeJSON(w, http.StatusForbidden, errBody(
+			fmt.Sprintf("模型 %s 在当前账号池中不可用（未订阅或已被封禁）", displayModel),
+			"model_not_entitled"))
+		return
+	}
+
+	useCascade := info.ModelUID != ""
+	hasTools := len(body.Tools) > 0
+	hasToolHistory := false
+	for _, m := range body.Messages {
+		if m.Role == "tool" || (m.Role == "assistant" && len(m.ToolCalls) > 0) {
+			hasToolHistory = true
+			break
+		}
+	}
+	emulateTools := useCascade && (hasTools || hasToolHistory)
+
+	toolPreamble := ""
+	if emulateTools {
+		toolPreamble = toolemu.BuildPreambleForProto(body.Tools, body.ToolChoice)
+	}
+
+	var cascadeMsgs []client.ChatMsg
+	var legacyMsgs []client.ChatMsg
+	if emulateTools {
+		for _, nm := range toolemu.Normalize(body.Messages) {
+			cascadeMsgs = append(cascadeMsgs, client.ChatMsg{Role: nm.Role, Content: nm.Content})
+		}
+	}
+	for _, m := range body.Messages {
+		msg := client.ChatMsg{
+			Role:    m.Role,
+			Content: contentToString(m.Content),
+		}
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			var lines []string
+			for _, tc := range m.ToolCalls {
+				name := tc.Function.Name
+				if name == "" {
+					name = "unknown"
+				}
+				args := tc.Function.Arguments
+				if args == "" {
+					args = "{}"
+				}
+				lines = append(lines, fmt.Sprintf("[called tool %s with %s]", name, args))
+			}
+			msg.ToolCallsText = strings.Join(lines, "\n")
+		}
+		if m.Role == "tool" {
+			msg.ToolCallID = m.ToolCallID
+		}
+		legacyMsgs = append(legacyMsgs, msg)
+	}
+	if !emulateTools {
+		cascadeMsgs = legacyMsgs
+	}
+
+	// Identity prompt injection — three-layer belt:
+	//   1. Cascade proto field 8 (test_section_content, top of system prompt)
+	//   2. Cascade proto field 13 (communication_section override)
+	//   3. Fallback: prepend as a system-role chat message (legacy + belt)
+	identityPrompt := ""
+	if runtimecfg.IsEnabled("modelIdentityPrompt") && info.Provider != "" {
+		identityPrompt = runtimecfg.BuildIdentityMessage(displayModel, info.Provider)
+		if identityPrompt != "" {
+			// Still keep the system-message prepend as a belt — if for some
+			// reason Cascade drops our proto overrides, the message-level
+			// identity can still reach the model via the user text payload.
+			sys := client.ChatMsg{Role: "system", Content: identityPrompt}
+			cascadeMsgs = append([]client.ChatMsg{sys}, cascadeMsgs...)
+			legacyMsgs = append([]client.ChatMsg{sys}, legacyMsgs...)
+		}
+	}
+
+	// Cache key (only applicable when no streaming or for replay).
+	ckey := cache.Key(cache.RequestBody{
+		Model: modelKey, Messages: raw, Tools: rawFromTools(body.Tools), ToolChoice: body.ToolChoice,
+		MaxTokens: body.MaxTokens,
+	})
+
+	chatID := genChatID()
+	created := time.Now().Unix()
+
+	if body.Stream {
+		d.streamChat(w, r, streamInput{
+			ChatID: chatID, Created: created, DisplayModel: displayModel,
+			ModelKey: modelKey, Info: info, Cascade: useCascade,
+			CascadeMsgs: cascadeMsgs, LegacyMsgs: legacyMsgs,
+			EmulateTools: emulateTools, ToolPreamble: toolPreamble,
+			IdentityPrompt: identityPrompt,
+			CacheKey:       ckey,
+		})
+		return
+	}
+	d.nonStreamChat(w, r, streamInput{
+		ChatID: chatID, Created: created, DisplayModel: displayModel,
+		ModelKey: modelKey, Info: info, Cascade: useCascade,
+		CascadeMsgs: cascadeMsgs, LegacyMsgs: legacyMsgs,
+		EmulateTools: emulateTools, ToolPreamble: toolPreamble,
+		CacheKey: ckey,
+	})
+}
+
+type streamInput struct {
+	ChatID         string
+	Created        int64
+	DisplayModel   string
+	ModelKey       string
+	Info           *models.Info
+	Cascade        bool
+	CascadeMsgs    []client.ChatMsg
+	LegacyMsgs     []client.ChatMsg
+	EmulateTools   bool
+	ToolPreamble   string
+	IdentityPrompt string
+	CacheKey       string
+}
+
+// ─── Non-stream ────────────────────────────────────────────
+
+func (d *Deps) nonStreamChat(w http.ResponseWriter, r *http.Request, in streamInput) {
+	// Cache hit.
+	if v, ok := cache.Get(in.CacheKey); ok {
+		logx.Info("Chat: cache HIT model=%s flow=non-stream", in.DisplayModel)
+		stats.Record(in.DisplayModel, true, 0, "")
+		writeJSON(w, http.StatusOK, nonStreamBody(in, v.Text, v.Thinking, nil, nil, "stop", true))
+		return
+	}
+
+	reuseEnabled := in.Cascade && !in.EmulateTools && runtimecfg.IsEnabled("cascadeConversationReuse")
+	fpBefore := ""
+	if reuseEnabled {
+		fpBefore = convpool.FingerprintBefore(convMessagesFromClient(in.CascadeMsgs))
+	}
+	var reuse *convpool.Entry
+	if reuseEnabled && fpBefore != "" {
+		reuse = convpool.Checkout(fpBefore)
+	}
+
+	tried := []string{}
+	var last *chatErr
+	maxAttempts := clamp(numActive(d.Pool), 3, streamMaxTries)
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		var acct *auth.Selected
+		if reuse != nil && attempt == 0 {
+			acct = d.Pool.AcquireByKey(reuse.APIKey, in.ModelKey)
+			if acct == nil {
+				logx.Info("Chat: cascade reuse skipped — owning account not available")
+				reuse = nil
+			}
+		}
+		if acct == nil {
+			acct = waitForAccount(r.Context(), d.Pool, tried, queueMaxWaitMS, in.ModelKey)
+			if acct == nil {
+				break
+			}
+		}
+		tried = append(tried, acct.APIKey)
+
+		px := proxycfg.Effective(acct.ID)
+
+		// Preflight rate-limit check (experimental) — save LS round-trips
+		// when the account is already out of capacity.
+		if runtimecfg.IsEnabled("preflightRateLimit") {
+			if rl, err := cloud.CheckMessageRateLimit(acct.APIKey, px); err == nil && !rl.HasCapacity {
+				logx.Warn("Preflight: %s has no capacity (remaining=%d), skipping", acct.Email, rl.MessagesRemaining)
+				d.Pool.MarkRateLimited(acct.APIKey, 5*time.Minute, in.ModelKey)
+				continue
+			}
+		}
+
+		ls, err := d.LSP.Ensure(r.Context(), px)
+		if err != nil {
+			last = &chatErr{status: http.StatusServiceUnavailable, typ: "ls_unavailable", msg: err.Error()}
+			break
+		}
+		entry := d.LSP.Get(px)
+		if entry == nil {
+			entry = ls
+		}
+		if reuse != nil && reuse.LSPort != entry.Port {
+			logx.Info("Chat: cascade reuse skipped — LS port changed")
+			reuse = nil
+		}
+
+		logx.Info("Chat: model=%s flow=%s attempt=%d account=%s ls=%d turns=%d chars=%d",
+			in.DisplayModel, flowName(in.Cascade), attempt+1, acct.Email, entry.Port,
+			len(in.CascadeMsgs), totalChars(in.CascadeMsgs))
+
+		cli := client.New(acct.APIKey, entry)
+		res, cerr := d.runOnce(r.Context(), cli, in, reuse)
+		cli.Close()
+
+		if cerr != nil {
+			if cerr.isRateLimit {
+				d.Pool.MarkRateLimited(acct.APIKey, rlDuration(cerr), in.ModelKey)
+				d.Pool.UpdateCapability(acct.APIKey, in.ModelKey, false, "rate_limit")
+				logx.Warn("Account %s rate-limited on %s (window=%s), trying next",
+					acct.Email, in.DisplayModel, rlDuration(cerr))
+				last = cerr
+				continue
+			}
+			if cerr.isInternal {
+				d.Pool.ReportInternalError(acct.APIKey)
+				last = cerr
+				continue
+			}
+			if cerr.isAuthFail {
+				d.Pool.ReportError(acct.APIKey)
+			}
+			if cerr.isModel {
+				d.Pool.UpdateCapability(acct.APIKey, in.ModelKey, false, "model_error")
+				logx.Warn("Account %s cannot serve %s, trying next", acct.Email, in.DisplayModel)
+				last = cerr
+				continue
+			}
+			last = cerr
+			break
+		}
+
+		d.Pool.ReportSuccess(acct.APIKey)
+		d.Pool.UpdateCapability(acct.APIKey, in.ModelKey, true, "success")
+		stats.Record(in.DisplayModel, true, time.Since(time.Unix(in.Created, 0)).Milliseconds(), acct.APIKey)
+
+		if reuseEnabled && res.CascadeID != "" && res.Text != "" {
+			fpAfter := convpool.FingerprintAfter(convMessagesFromClient(in.CascadeMsgs), res.Text)
+			convpool.Checkin(fpAfter, convpool.Entry{
+				CascadeID: res.CascadeID, SessionID: res.SessionID,
+				LSPort: entry.Port, APIKey: acct.APIKey,
+			})
+		}
+
+		if len(res.ToolCalls) == 0 && (res.Text != "" || res.Thinking != "") {
+			cache.Set(in.CacheKey, cache.Entry{Text: res.Text, Thinking: res.Thinking})
+		}
+
+		finish := "stop"
+		if len(res.ToolCalls) > 0 {
+			finish = "tool_calls"
+		}
+		writeJSON(w, http.StatusOK, nonStreamBody(in, res.Text, res.Thinking, res.ToolCalls, res.Usage, finish, false))
+		return
+	}
+
+	// ── Retry exhausted ──
+	stats.Record(in.DisplayModel, false, time.Since(time.Unix(in.Created, 0)).Milliseconds(), "")
+	if last == nil {
+		if all, retry := d.Pool.IsAllRateLimited(in.ModelKey); all {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", retry/1000+1))
+			writeJSON(w, http.StatusTooManyRequests, errBody(
+				fmt.Sprintf("%s 所有账号均已达速率限制，请 %d 秒后重试", in.DisplayModel, retry/1000+1),
+				"rate_limit_exceeded"))
+			return
+		}
+		writeJSON(w, http.StatusServiceUnavailable, errBody("No active accounts available", "pool_exhausted"))
+		return
+	}
+	writeJSON(w, last.status, errBody(sanitize.Text(last.msg), last.typ))
+}
+
+// runOnce runs a single Cascade/Legacy attempt and classifies the error.
+type chatErr struct {
+	status      int
+	typ         string
+	msg         string
+	isModel     bool
+	isRateLimit bool
+	isInternal  bool
+	isAuthFail  bool
+	// retryAfter is the server-reported rate-limit window parsed from the
+	// error message (e.g. "27m31s"). Zero means "not parseable — use the
+	// caller's fallback". Does NOT include the pool's safety grace; the
+	// pool layer adds that separately.
+	retryAfter time.Duration
+}
+
+var (
+	reRateLimit = regexp.MustCompile(`(?i)rate limit|rate_limit|too many requests|quota`)
+	reInternal  = regexp.MustCompile(`(?i)internal error occurred.*error id`)
+	reAuthFail  = regexp.MustCompile(`(?i)unauthenticated|invalid api key|invalid_grant|permission_denied.*account`)
+
+	// Upstream rate-limit messages carry the retry window in several forms.
+	// Try each matcher in order — first hit wins.
+	//
+	//   - Go-duration style appearing anywhere in the message ("27m31s",
+	//     "5m", "300s", "1h15m"). This is what Codeium actually emits.
+	//   - Loose "retry after 30 seconds" / "wait 5 minutes" prose.
+	//   - Bare "retry_after: 30" integer (seconds).
+	reRetryGoDuration = regexp.MustCompile(`\b(\d+h)?(\d+m)?(\d+s)?\b`)
+	reRetryProse      = regexp.MustCompile(`(?i)(?:retry\s+after|wait|try\s+again\s+in|please\s+wait|available\s+in)\s+(\d+)\s*(second|minute|hour|s|m|h)\b`)
+	reRetrySecondsKey = regexp.MustCompile(`(?i)retry[-_ ]?after[-_ ]?(?:seconds)?\s*[:=]\s*(\d+)`)
+)
+
+// rlDuration is the effective rate-limit window for MarkRateLimited: the
+// server-reported retryAfter when available, otherwise a 5-minute default
+// (matches the JS service's fallback). The pool layer adds its own grace.
+func rlDuration(ce *chatErr) time.Duration {
+	if ce != nil && ce.retryAfter > 0 {
+		return ce.retryAfter
+	}
+	return 5 * time.Minute
+}
+
+// parseRetryAfter scans an upstream error message for the rate-limit window
+// the server told us to wait. Returns zero when no window is found — the
+// caller should fall back to a sane default like 5 minutes.
+func parseRetryAfter(msg string) time.Duration {
+	if msg == "" {
+		return 0
+	}
+	// Go-duration — scan across the message and pick the first real match
+	// (the regex itself also matches the empty string, so skip those).
+	for _, m := range reRetryGoDuration.FindAllString(msg, -1) {
+		if m == "" {
+			continue
+		}
+		// Must contain at least one h/m/s to be a duration, not just "5".
+		if !strings.ContainsAny(m, "hms") {
+			continue
+		}
+		if d, err := time.ParseDuration(m); err == nil && d > 0 {
+			return d
+		}
+	}
+	if m := reRetryProse.FindStringSubmatch(msg); m != nil {
+		n, err := strconv.Atoi(m[1])
+		if err != nil || n <= 0 {
+			return 0
+		}
+		switch strings.ToLower(m[2]) {
+		case "h", "hour":
+			return time.Duration(n) * time.Hour
+		case "m", "minute":
+			return time.Duration(n) * time.Minute
+		default:
+			return time.Duration(n) * time.Second
+		}
+	}
+	if m := reRetrySecondsKey.FindStringSubmatch(msg); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 0
+}
+
+// runResult bundles everything the attempt produced so we can check into the
+// conversation pool with a real cascadeID.
+type runResult struct {
+	Text      string
+	Thinking  string
+	ToolCalls []toolemu.ToolCall
+	Usage     *usageBody
+	CascadeID string
+	SessionID string
+}
+
+func (d *Deps) runOnce(ctx context.Context, cli *client.Client, in streamInput, reuse *convpool.Entry) (*runResult, *chatErr) {
+	var cascadeOpts client.CascadeOptions
+	cascadeOpts.ToolPreamble = in.ToolPreamble
+	cascadeOpts.IdentityPrompt = in.IdentityPrompt
+	if reuse != nil {
+		cascadeOpts.ReuseEntry = &client.ReuseRef{CascadeID: reuse.CascadeID, SessionID: reuse.SessionID}
+	}
+
+	out := &runResult{}
+	if in.Cascade {
+		res, err := cli.CascadeChat(ctx, in.CascadeMsgs, in.Info.Enum, in.Info.ModelUID, cascadeOpts)
+		if err != nil {
+			return nil, classify(err)
+		}
+		out.CascadeID = res.CascadeID
+		out.SessionID = res.SessionID
+		text := sanitize.Text(res.Text)
+		thinking := sanitize.Text(res.Thinking)
+		parsed := toolemu.ParseAll(text)
+		out.Text = parsed.Text
+		out.Thinking = thinking
+		if in.EmulateTools {
+			out.ToolCalls = parsed.ToolCalls
+		}
+		out.Usage = buildUsageFromCascade(res.Usage, in.CascadeMsgs, out.Text, out.Thinking)
+		return out, nil
+	}
+	chunks, err := cli.RawChat(ctx, in.LegacyMsgs, in.Info.Enum, in.Info.ModelUID, nil)
+	if err != nil {
+		return nil, classify(err)
+	}
+	var b strings.Builder
+	for _, c := range chunks {
+		b.WriteString(c.Text)
+	}
+	out.Text = sanitize.Text(b.String())
+	out.Usage = buildUsageFromCascade(nil, in.LegacyMsgs, out.Text, "")
+	return out, nil
+}
+
+func classify(err error) *chatErr {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	out := &chatErr{msg: msg, status: http.StatusBadGateway, typ: "upstream_error"}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		out.typ = "client_cancelled"
+		return out
+	}
+	if client.IsModelError(err) {
+		out.isModel = true
+		out.status = http.StatusForbidden
+		out.typ = "model_not_available"
+	}
+	if reRateLimit.MatchString(msg) {
+		out.isRateLimit = true
+		out.isModel = true
+		out.status = http.StatusTooManyRequests
+		out.typ = "rate_limit_exceeded"
+		out.retryAfter = parseRetryAfter(msg)
+	}
+	if reInternal.MatchString(msg) {
+		out.isInternal = true
+		out.isModel = true
+	}
+	if reAuthFail.MatchString(msg) {
+		out.isAuthFail = true
+	}
+	return out
+}
+
+// ─── Stream ───────────────────────────────────────────────
+
+func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, errBody("streaming not supported", "server_error"))
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	send := func(v any) {
+		b, _ := json.Marshal(v)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+		flusher.Flush()
+	}
+
+	// SSE heartbeat
+	hbCtx, hbCancel := context.WithCancel(r.Context())
+	defer hbCancel()
+	go func() {
+		t := time.NewTicker(heartbeatMS)
+		defer t.Stop()
+		for {
+			select {
+			case <-hbCtx.Done():
+				return
+			case <-t.C:
+				_, _ = fmt.Fprint(w, ": ping\n\n")
+				flusher.Flush()
+			}
+		}
+	}()
+
+	// Cache replay path.
+	if v, ok := cache.Get(in.CacheKey); ok {
+		logx.Info("Chat: cache HIT model=%s flow=stream", in.DisplayModel)
+		stats.Record(in.DisplayModel, true, 0, "")
+		send(chunkRole(in))
+		if v.Thinking != "" {
+			send(chunkThinking(in, v.Thinking))
+		}
+		if v.Text != "" {
+			send(chunkContent(in, v.Text))
+		}
+		send(chunkFinish(in, "stop", cachedUsage(in.CascadeMsgs, v.Text)))
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+
+	start := time.Now()
+	tried := []string{}
+	rolePrinted := false
+	hadSuccess := false
+	collected := []toolemu.ToolCall{}
+	var accText, accThink strings.Builder
+	var curAPIKey string
+
+	var pathT sanitize.Stream
+	var pathK sanitize.Stream
+	var parser toolemu.StreamParser
+
+	emitContent := func(s string) {
+		if s == "" {
+			return
+		}
+		accText.WriteString(s)
+		send(chunkContent(in, s))
+	}
+	emitThink := func(s string) {
+		if s == "" {
+			return
+		}
+		accThink.WriteString(s)
+		send(chunkThinking(in, s))
+	}
+	emitTool := func(tc toolemu.ToolCall, idx int) {
+		send(map[string]any{
+			"id": in.ChatID, "object": "chat.completion.chunk", "created": in.Created, "model": in.DisplayModel,
+			"choices": []map[string]any{{
+				"index": 0,
+				"delta": map[string]any{"tool_calls": []map[string]any{{
+					"index": idx, "id": tc.ID, "type": "function",
+					"function": map[string]any{"name": tc.Name, "arguments": sanitize.Text(tc.ArgumentsJSON)},
+				}}},
+				"finish_reason": nil,
+			}},
+		})
+	}
+
+	onChunk := func(c client.Chunk) {
+		if !rolePrinted {
+			rolePrinted = true
+			send(chunkRole(in))
+		}
+		hadSuccess = true
+		if c.Text != "" {
+			if in.Cascade {
+				out := parser.Feed(c.Text)
+				if out.Text != "" {
+					emitContent(pathT.Feed(out.Text))
+				}
+				if in.EmulateTools {
+					for _, tc := range out.ToolCalls {
+						idx := len(collected)
+						collected = append(collected, tc)
+						emitTool(tc, idx)
+					}
+				}
+			} else {
+				emitContent(pathT.Feed(c.Text))
+			}
+		}
+		if c.Thinking != "" {
+			emitThink(pathK.Feed(c.Thinking))
+		}
+	}
+
+	reuseEnabled := in.Cascade && !in.EmulateTools && runtimecfg.IsEnabled("cascadeConversationReuse")
+	var reuse *convpool.Entry
+	if reuseEnabled {
+		fp := convpool.FingerprintBefore(convMessagesFromClient(in.CascadeMsgs))
+		if fp != "" {
+			reuse = convpool.Checkout(fp)
+		}
+	}
+
+	maxAttempts := clamp(numActive(d.Pool), 3, streamMaxTries)
+	var lastErr error
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if r.Context().Err() != nil {
+			return
+		}
+		var acct *auth.Selected
+		if reuse != nil && attempt == 0 {
+			acct = d.Pool.AcquireByKey(reuse.APIKey, in.ModelKey)
+			if acct == nil {
+				reuse = nil
+			}
+		}
+		if acct == nil {
+			acct = waitForAccount(r.Context(), d.Pool, tried, queueMaxWaitMS, in.ModelKey)
+			if acct == nil {
+				break
+			}
+		}
+		tried = append(tried, acct.APIKey)
+		curAPIKey = acct.APIKey
+
+		px := proxycfg.Effective(acct.ID)
+
+		if runtimecfg.IsEnabled("preflightRateLimit") {
+			if rl, err := cloud.CheckMessageRateLimit(acct.APIKey, px); err == nil && !rl.HasCapacity {
+				logx.Warn("Preflight: %s has no capacity (remaining=%d), skipping", acct.Email, rl.MessagesRemaining)
+				d.Pool.MarkRateLimited(acct.APIKey, 5*time.Minute, in.ModelKey)
+				continue
+			}
+		}
+
+		_, err := d.LSP.Ensure(r.Context(), px)
+		if err != nil {
+			lastErr = err
+			break
+		}
+		entry := d.LSP.Get(px)
+		if entry == nil {
+			lastErr = errors.New("No LS instance available")
+			break
+		}
+		logx.Info("Chat: model=%s flow=%s stream=true attempt=%d account=%s ls=%d turns=%d",
+			in.DisplayModel, flowName(in.Cascade), attempt+1, acct.Email, entry.Port, len(in.CascadeMsgs))
+
+		cli := client.New(acct.APIKey, entry)
+
+		var cascadeResult *client.CascadeResult
+		if in.Cascade {
+			opts := client.CascadeOptions{
+				ToolPreamble:   in.ToolPreamble,
+				IdentityPrompt: in.IdentityPrompt,
+				OnChunk:        onChunk,
+			}
+			if reuse != nil {
+				opts.ReuseEntry = &client.ReuseRef{CascadeID: reuse.CascadeID, SessionID: reuse.SessionID}
+			}
+			cascadeResult, err = cli.CascadeChat(r.Context(), in.CascadeMsgs, in.Info.Enum, in.Info.ModelUID, opts)
+		} else {
+			_, err = cli.RawChat(r.Context(), in.LegacyMsgs, in.Info.Enum, in.Info.ModelUID, onChunk)
+		}
+		cli.Close()
+
+		if err != nil {
+			lastErr = err
+			ce := classify(err)
+			if ce == nil {
+				break
+			}
+			if ce.isAuthFail {
+				d.Pool.ReportError(acct.APIKey)
+			}
+			if ce.isRateLimit {
+				d.Pool.MarkRateLimited(acct.APIKey, rlDuration(ce), in.ModelKey)
+			}
+			if ce.isInternal {
+				d.Pool.ReportInternalError(acct.APIKey)
+			}
+			if ce.isModel && !ce.isRateLimit && !ce.isInternal {
+				d.Pool.UpdateCapability(acct.APIKey, in.ModelKey, false, "model_error")
+			}
+			if !hadSuccess && (ce.isModel || ce.isRateLimit) {
+				reuse = nil
+				continue
+			}
+			break
+		}
+
+		// Tail flush.
+		flush := parser.Flush()
+		if flush.Text != "" {
+			emitContent(pathT.Feed(flush.Text))
+		}
+		if in.EmulateTools {
+			for _, tc := range flush.ToolCalls {
+				idx := len(collected)
+				collected = append(collected, tc)
+				emitTool(tc, idx)
+			}
+		}
+		emitContent(pathT.Flush())
+		emitThink(pathK.Flush())
+
+		if hadSuccess {
+			d.Pool.ReportSuccess(acct.APIKey)
+		}
+		d.Pool.UpdateCapability(acct.APIKey, in.ModelKey, true, "success")
+		stats.Record(in.DisplayModel, true, time.Since(start).Milliseconds(), acct.APIKey)
+
+		if !rolePrinted {
+			send(chunkRole(in))
+		}
+		finish := "stop"
+		if len(collected) > 0 {
+			finish = "tool_calls"
+		}
+		var usage *usageBody
+		if cascadeResult != nil {
+			usage = buildUsageFromCascade(cascadeResult.Usage, in.CascadeMsgs, accText.String(), accThink.String())
+		} else {
+			usage = buildUsageFromCascade(nil, in.LegacyMsgs, accText.String(), "")
+		}
+		send(chunkFinish(in, finish, usage))
+		// include_usage-style terminal chunk
+		send(map[string]any{
+			"id": in.ChatID, "object": "chat.completion.chunk", "created": in.Created, "model": in.DisplayModel,
+			"choices": []any{}, "usage": usage,
+		})
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+
+		if len(collected) == 0 && (accText.Len() > 0 || accThink.Len() > 0) {
+			cache.Set(in.CacheKey, cache.Entry{Text: accText.String(), Thinking: accThink.String()})
+		}
+		return
+	}
+
+	// All attempts failed.
+	stats.Record(in.DisplayModel, false, time.Since(start).Milliseconds(), curAPIKey)
+	if !rolePrinted {
+		send(chunkRole(in))
+	}
+	msg := "no accounts"
+	if lastErr != nil {
+		msg = sanitize.Text(lastErr.Error())
+	}
+	if all, retry := d.Pool.IsAllRateLimited(in.ModelKey); all {
+		msg = fmt.Sprintf("%s 所有账号均已达速率限制，请 %d 秒后重试", in.DisplayModel, retry/1000+1)
+	}
+	send(map[string]any{
+		"id": in.ChatID, "object": "chat.completion.chunk", "created": in.Created, "model": in.DisplayModel,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{"content": fmt.Sprintf("\n[Error: %s]", msg)},
+			"finish_reason": "stop",
+		}},
+	})
+	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// ─── Response body builders ────────────────────────────────
+
+type usageBody struct {
+	PromptTokens            int            `json:"prompt_tokens"`
+	CompletionTokens        int            `json:"completion_tokens"`
+	TotalTokens             int            `json:"total_tokens"`
+	InputTokens             int            `json:"input_tokens"`
+	OutputTokens            int            `json:"output_tokens"`
+	PromptTokensDetails     map[string]int `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails map[string]int `json:"completion_tokens_details,omitempty"`
+	CacheCreationInputTokens int           `json:"cache_creation_input_tokens,omitempty"`
+	Cached                  bool           `json:"cached,omitempty"`
+}
+
+func estimateTokens(msgs []client.ChatMsg) int {
+	chars := 0
+	for _, m := range msgs {
+		chars += len(m.Content)
+	}
+	n := (chars + 3) / 4
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+func buildUsageFromCascade(u *windsurf.Usage, msgs []client.ChatMsg, text, thinking string) *usageBody {
+	if u != nil && (u.InputTokens != 0 || u.OutputTokens != 0) {
+		prompt := int(u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens)
+		out := int(u.OutputTokens)
+		return &usageBody{
+			PromptTokens: prompt, CompletionTokens: out,
+			TotalTokens:  prompt + out,
+			InputTokens:  prompt, OutputTokens: out,
+			PromptTokensDetails:      map[string]int{"cached_tokens": int(u.CacheReadTokens)},
+			CacheCreationInputTokens: int(u.CacheWriteTokens),
+		}
+	}
+	pt := estimateTokens(msgs)
+	ct := ((len(text) + len(thinking)) + 3) / 4
+	if ct < 1 {
+		ct = 1
+	}
+	return &usageBody{
+		PromptTokens: pt, CompletionTokens: ct, TotalTokens: pt + ct,
+		InputTokens: pt, OutputTokens: ct,
+		PromptTokensDetails: map[string]int{"cached_tokens": 0},
+	}
+}
+
+func cachedUsage(msgs []client.ChatMsg, text string) *usageBody {
+	pt := estimateTokens(msgs)
+	ct := (len(text) + 3) / 4
+	if ct < 1 {
+		ct = 1
+	}
+	return &usageBody{
+		PromptTokens: pt, CompletionTokens: ct, TotalTokens: pt + ct,
+		InputTokens: pt, OutputTokens: ct,
+		PromptTokensDetails: map[string]int{"cached_tokens": pt},
+		Cached:              true,
+	}
+}
+
+func nonStreamBody(in streamInput, text, thinking string, toolCalls []toolemu.ToolCall, usage *usageBody, finish string, cached bool) map[string]any {
+	message := map[string]any{"role": "assistant"}
+	if len(toolCalls) > 0 {
+		message["content"] = nil
+		tcs := make([]map[string]any, 0, len(toolCalls))
+		for _, tc := range toolCalls {
+			tcs = append(tcs, map[string]any{
+				"id": tc.ID, "type": "function",
+				"function": map[string]any{
+					"name":      tc.Name,
+					"arguments": sanitize.Text(tc.ArgumentsJSON),
+				},
+			})
+		}
+		message["tool_calls"] = tcs
+	} else {
+		if text != "" {
+			message["content"] = text
+		} else {
+			message["content"] = nil
+		}
+	}
+	if thinking != "" {
+		message["reasoning_content"] = thinking
+	}
+	if usage == nil {
+		if cached {
+			usage = cachedUsage(in.CascadeMsgs, text)
+		} else {
+			usage = buildUsageFromCascade(nil, in.CascadeMsgs, text, thinking)
+		}
+	}
+	return map[string]any{
+		"id": in.ChatID, "object": "chat.completion", "created": in.Created, "model": in.DisplayModel,
+		"choices": []map[string]any{{"index": 0, "message": message, "finish_reason": finish}},
+		"usage":   usage,
+	}
+}
+
+func chunkRole(in streamInput) map[string]any {
+	return map[string]any{
+		"id": in.ChatID, "object": "chat.completion.chunk", "created": in.Created, "model": in.DisplayModel,
+		"choices": []map[string]any{{
+			"index": 0, "delta": map[string]any{"role": "assistant", "content": ""}, "finish_reason": nil,
+		}},
+	}
+}
+func chunkContent(in streamInput, s string) map[string]any {
+	return map[string]any{
+		"id": in.ChatID, "object": "chat.completion.chunk", "created": in.Created, "model": in.DisplayModel,
+		"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": s}, "finish_reason": nil}},
+	}
+}
+func chunkThinking(in streamInput, s string) map[string]any {
+	return map[string]any{
+		"id": in.ChatID, "object": "chat.completion.chunk", "created": in.Created, "model": in.DisplayModel,
+		"choices": []map[string]any{{"index": 0, "delta": map[string]any{"reasoning_content": s}, "finish_reason": nil}},
+	}
+}
+func chunkFinish(in streamInput, reason string, usage *usageBody) map[string]any {
+	return map[string]any{
+		"id": in.ChatID, "object": "chat.completion.chunk", "created": in.Created, "model": in.DisplayModel,
+		"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": reason}},
+		"usage":   usage,
+	}
+}
+
+// ─── Misc helpers ─────────────────────────────────────────
+
+func rawFromTools(t []toolemu.Tool) json.RawMessage {
+	b, _ := json.Marshal(t)
+	return b
+}
+
+func contentToString(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var arr []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		var b strings.Builder
+		for _, p := range arr {
+			if p.Type == "text" {
+				b.WriteString(p.Text)
+			}
+		}
+		return b.String()
+	}
+	return string(raw)
+}
+
+func genChatID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return "chatcmpl-" + hex.EncodeToString(b[:])[:29]
+}
+
+func flowName(cascade bool) string {
+	if cascade {
+		return "cascade"
+	}
+	return "legacy"
+}
+
+func totalChars(msgs []client.ChatMsg) int {
+	n := 0
+	for _, m := range msgs {
+		n += len(m.Content)
+	}
+	return n
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		v = lo
+	}
+	if v > hi {
+		v = hi
+	}
+	return v
+}
+
+func numActive(p *auth.Pool) int {
+	return p.Counts().Active
+}
+
+func waitForAccount(ctx context.Context, p *auth.Pool, tried []string, max time.Duration, modelKey string) *auth.Selected {
+	deadline := time.Now().Add(max)
+	for {
+		if a := p.Acquire(tried, modelKey); a != nil {
+			return a
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(queueRetryMS):
+		}
+	}
+}
+
+func convMessagesFromClient(msgs []client.ChatMsg) []convpool.Message {
+	out := make([]convpool.Message, len(msgs))
+	for i, m := range msgs {
+		out[i] = convpool.Message{Role: m.Role, Content: m.Content}
+	}
+	return out
+}

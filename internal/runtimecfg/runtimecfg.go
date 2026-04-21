@@ -1,0 +1,195 @@
+// Package runtimecfg is the runtime-editable feature-flag + identity-prompt
+// store. Backed by runtime-config.json next to the binary, hot-editable from
+// the dashboard. Mirrors src/runtime-config.js.
+package runtimecfg
+
+import (
+	"encoding/json"
+	"os"
+	"strings"
+	"sync"
+
+	"windsurfapi/internal/logx"
+)
+
+// Default identity-prompt templates — {model} is replaced at injection time.
+var DefaultIdentityPrompts = map[string]string{
+	"anthropic": "You are {model}, a large language model created by Anthropic. You are helpful, harmless, and honest. When asked about your identity or which model you are, you respond that you are {model}, made by Anthropic.",
+	"openai":    "You are {model}, a large language model created by OpenAI. When asked about your identity, you respond that you are {model}, made by OpenAI.",
+	"google":    "You are {model}, a large language model created by Google. When asked about your identity, you respond that you are {model}, made by Google.",
+	"deepseek":  "You are {model}, a large language model created by DeepSeek. When asked about your identity, you respond that you are {model}, made by DeepSeek.",
+	"xai":       "You are {model}, a large language model created by xAI. When asked about your identity, you respond that you are {model}, made by xAI.",
+	"alibaba":   "You are {model}, a large language model created by Alibaba. When asked about your identity, you respond that you are {model}, made by Alibaba.",
+	"moonshot":  "You are {model}, a large language model created by Moonshot AI. When asked about your identity, you respond that you are {model}, made by Moonshot AI.",
+	"zhipu":     "You are {model}, a large language model created by Zhipu AI. When asked about your identity, you respond that you are {model}, made by Zhipu AI.",
+	"minimax":   "You are {model}, a large language model created by MiniMax. When asked about your identity, you respond that you are {model}, made by MiniMax.",
+	"windsurf":  "You are {model}, a coding assistant model by Windsurf. When asked about your identity, you respond that you are {model}, made by Windsurf.",
+}
+
+// Experimental holds the three feature toggles the JS version exposes.
+type Experimental struct {
+	CascadeConversationReuse bool `json:"cascadeConversationReuse"`
+	ModelIdentityPrompt      bool `json:"modelIdentityPrompt"`
+	PreflightRateLimit       bool `json:"preflightRateLimit"`
+}
+
+type file struct {
+	Experimental    Experimental      `json:"experimental"`
+	IdentityPrompts map[string]string `json:"identityPrompts"`
+}
+
+var (
+	mu    sync.RWMutex
+	state = file{
+		Experimental: Experimental{
+			ModelIdentityPrompt: true, // ON by default — matches JS DEFAULTS
+		},
+		IdentityPrompts: cloneMap(DefaultIdentityPrompts),
+	}
+	path = "runtime-config.json"
+)
+
+// Init loads runtime-config.json. Call once at startup.
+func Init() {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var loaded file
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		logx.Warn("runtime-config: load failed: %s", err.Error())
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	state.Experimental = loaded.Experimental
+	if loaded.IdentityPrompts != nil {
+		// Merge on top of defaults so a partial save doesn't nuke unset keys.
+		merged := cloneMap(DefaultIdentityPrompts)
+		for k, v := range loaded.IdentityPrompts {
+			merged[k] = v
+		}
+		state.IdentityPrompts = merged
+	}
+}
+
+func persist() {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		logx.Warn("runtime-config: marshal: %s", err.Error())
+		return
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		logx.Warn("runtime-config: write: %s", err.Error())
+	}
+}
+
+// ─── Experimental flags ────────────────────────────────────
+
+func GetExperimental() Experimental {
+	mu.RLock()
+	defer mu.RUnlock()
+	return state.Experimental
+}
+
+// SetExperimentalPatch merges patch into the current flags — only fields
+// present in patch are overwritten. This matches the JS setExperimental()
+// spread semantics so a PUT `{cascadeConversationReuse:true}` does not
+// reset `modelIdentityPrompt` back to false.
+func SetExperimentalPatch(patch map[string]any) Experimental {
+	mu.Lock()
+	defer mu.Unlock()
+	if v, ok := patch["cascadeConversationReuse"].(bool); ok {
+		state.Experimental.CascadeConversationReuse = v
+	}
+	if v, ok := patch["modelIdentityPrompt"].(bool); ok {
+		state.Experimental.ModelIdentityPrompt = v
+	}
+	if v, ok := patch["preflightRateLimit"].(bool); ok {
+		state.Experimental.PreflightRateLimit = v
+	}
+	persist()
+	return state.Experimental
+}
+
+// SetExperimental is kept for callers that already hold a full struct.
+func SetExperimental(e Experimental) Experimental {
+	mu.Lock()
+	defer mu.Unlock()
+	state.Experimental = e
+	persist()
+	return state.Experimental
+}
+
+// IsEnabled is a convenience for the hot path.
+func IsEnabled(flag string) bool {
+	mu.RLock()
+	defer mu.RUnlock()
+	switch flag {
+	case "cascadeConversationReuse":
+		return state.Experimental.CascadeConversationReuse
+	case "modelIdentityPrompt":
+		return state.Experimental.ModelIdentityPrompt
+	case "preflightRateLimit":
+		return state.Experimental.PreflightRateLimit
+	}
+	return false
+}
+
+// ─── Identity prompts ─────────────────────────────────────
+
+func GetIdentityPrompts() map[string]string {
+	mu.RLock()
+	defer mu.RUnlock()
+	return cloneMap(state.IdentityPrompts)
+}
+
+func IdentityFor(provider string) string {
+	mu.RLock()
+	defer mu.RUnlock()
+	return state.IdentityPrompts[provider]
+}
+
+// BuildIdentityMessage renders the provider-specific template with {model}
+// substituted. Returns "" when no template exists (i.e. identity prompt
+// injection is not applicable for this request).
+func BuildIdentityMessage(displayModel, provider string) string {
+	tpl := IdentityFor(provider)
+	if tpl == "" {
+		return ""
+	}
+	return strings.ReplaceAll(tpl, "{model}", displayModel)
+}
+
+func SetIdentityPrompts(patch map[string]string) map[string]string {
+	mu.Lock()
+	defer mu.Unlock()
+	if state.IdentityPrompts == nil {
+		state.IdentityPrompts = map[string]string{}
+	}
+	for k, v := range patch {
+		state.IdentityPrompts[k] = strings.TrimSpace(v)
+	}
+	persist()
+	return cloneMap(state.IdentityPrompts)
+}
+
+func ResetIdentityPrompt(provider string) map[string]string {
+	mu.Lock()
+	defer mu.Unlock()
+	if provider == "" {
+		state.IdentityPrompts = cloneMap(DefaultIdentityPrompts)
+	} else {
+		delete(state.IdentityPrompts, provider)
+	}
+	persist()
+	return cloneMap(state.IdentityPrompts)
+}
+
+func cloneMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
