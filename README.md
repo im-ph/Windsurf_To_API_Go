@@ -1,161 +1,127 @@
-# WindsurfAPI — Go rewrite
+# WindsurfAPI · Go 重写版
 
-Drop-in Go port of the Node.js service. **9,300+ lines**, **single static
-binary (~11.8 MB)**, embeds the 131 KB dashboard SPA, zero runtime
-dependencies beyond `language_server_linux_x64`.
+将 Windsurf 的官方 Language Server 封装为 OpenAI / Anthropic 兼容的单文件反向代理，自带管理控制台。零运行时依赖，除同目录下的 `language_server_linux_x64` 外无需额外文件。
 
-## Status
+- **语言 / 运行时**：Go ≥ 1.22，静态编译，Linux amd64 产物约 9 MB
+- **内嵌前端**：Vue 3 + TypeScript + Ant Design Vue 4，`//go:embed` 打入二进制
+- **兼容协议**：OpenAI `/v1/chat/completions` + Anthropic `/v1/messages`（原生 SSE 透传）
+- **账号池**：分层 RPM 加权调度、按模型级别的限速/限流隔离、Firebase 令牌自动刷新
+- **控制台**：9 个页面（仪表盘 / 统计分析 / 登录取号 / 账号管理 / 异常监测 / 模型控制 / 代理配置 / 运行日志 / 实验性功能）
 
-| Phase | Scope | Status |
-|---|---|---|
-| P1 | protobuf codec · gRPC-over-HTTP/2 client · LS process pool · WindsurfClient · account pool · models catalog · cache · sanitize · conv pool | ✓ |
-| P2 | `/v1/chat/completions` (stream + non-stream) · tool emulation · runtime-config · stats · model-access · proxy-config | ✓ |
-| P3 | `/v1/messages` Anthropic bridge (live SSE translator) · Codeium cloud REST · Firebase email+password · token refresh · OAuth re-register · proxy CONNECT tunnel · periodic tasks (6h probe / 15 min credits / 50 min Firebase) · preflight rate-limit | ✓ |
-| P4 | dashboard API (25+ routes) · SSE log stream · JSONL daily rotation · embedded SPA · self-update via PM2 restart · proxy egress-IP test | ✓ |
-
-## Layout
-
-```
-go/
-  cmd/windsurfapi/main.go          entrypoint
-  internal/
-    config/      .env + typed config
-    logx/        ring buffer + SSE fan-out + JSONL rotation
-    pbenc/       zero-dep protobuf wire codec
-    grpcx/       HTTP/2 gRPC unary + stream (h2c)
-    windsurf/    exa.language_server_pb builders / parsers (Cascade + Legacy)
-    models/      107-model catalog + tier access
-    cache/       exact-body response cache
-    sanitize/    /tmp/windsurf-workspace path scrubber (stream-safe)
-    convpool/    Cascade cascade_id reuse pool
-    langserver/  language_server_linux_x64 process pool (per-proxy)
-    client/      WindsurfClient (Cascade + Legacy flows + stall logic)
-    auth/        account pool, tier, RPM weighting, capability probe, credit refresh
-    cloud/       Codeium REST (GetUserStatus / ModelConfigs / RateLimit / register_user)
-    firebase/    sign-in + token refresh + re-register (UA fingerprint rotation)
-    toolemu/     OpenAI tools[] ↔ Cascade text-protocol
-    modelaccess/ global allow/block list
-    proxycfg/    global + per-account HTTP proxy
-    runtimecfg/  runtime-config.json (experimental flags + identity prompts)
-    stats/       per-model / per-account / 72h-bucket stats with p50/p95
-    server/      HTTP router + chat + messages + probe builder
-    dashapi/     every /dashboard/api/* route
-    web/         embed index.html
-```
-
-## Build & run
+## 快速开始
 
 ```bash
-cd go
-go build -o windsurfapi ./cmd/windsurfapi
+git clone https://cnb.cool/Neko_Kernel/Windsurf_To_API_Go.git
+cd Windsurf_To_API_Go
+
+# 前端构建产物（dist/）已随仓库提交，如要改前端：
+# pnpm --dir web install && pnpm --dir web build
+
+# 编译（Linux 生产）
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+  -ldflags='-s -w' -trimpath \
+  -o windsurfapi ./cmd/windsurfapi
+
+# 本机跑起来（端口默认 3003，控制台 /dashboard）
+cp .env.example .env
 ./windsurfapi
 ```
 
-Go ≥ 1.22. External deps: `golang.org/x/net/http2` (h2c client for the LS
-local gRPC) plus its transitive `golang.org/x/text`.
+浏览器打开 `http://<host>:3003/dashboard` 即可。
 
-Dashboard: `http://<host>:<PORT>/dashboard`
+## 文档索引
 
-## Env
+| 文档 | 内容 |
+|---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | 从源码 / 预编译二进制两种安装路径、依赖、Language Server 放置方式 |
+| [docs/USAGE.md](docs/USAGE.md) | 控制台各面板用法、API 接入示例、常见排障 |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | systemd 生产部署、专用用户、文件权限、自更新 |
+| [docs/ENV_VARS.md](docs/ENV_VARS.md) | 所有环境变量、默认值、优先级、安全注意 |
+| [docs/API.md](docs/API.md) | HTTP 接口参考（聊天、Anthropic 消息、认证、控制台 API） |
+| [CHANGELOG.md](CHANGELOG.md) | 版本记录 |
 
-Same names as the JS service — see `.env.example`. Load order: process env
-overrides `.env`. Key vars:
-
-- `PORT` — HTTP listener (default 3003)
-- `API_KEY` — required for `/v1/chat/completions` + `/v1/messages` (leave empty = open)
-- `DASHBOARD_PASSWORD` — required for `/dashboard/api/*` (falls back to `API_KEY` when unset)
-- `LS_BINARY_PATH` — default `/opt/windsurf/language_server_linux_x64`
-- `CODEIUM_API_KEY` / `CODEIUM_AUTH_TOKEN` — comma-separated, loaded at boot
-
-## Endpoints
+## 目录结构
 
 ```
-POST /v1/chat/completions     OpenAI compatible (stream + non-stream)
-POST /v1/messages             Anthropic compatible (live SSE translator)
-GET  /v1/models
-POST /auth/login              {api_key}|{token}|{email,password} (batch via {accounts:[…]})
-GET  /auth/accounts           list all accounts
-DELETE /auth/accounts/:id
-GET  /auth/status
-GET  /health
-GET  /dashboard               SPA (131 KB HTML, embedded via //go:embed)
-/dashboard/api/*              25+ routes, match 1-1 with JS
+Windsurf_To_API_Go/
+├── cmd/windsurfapi/main.go       程序入口
+├── internal/
+│   ├── auth/                     账号池（分层 RPM、限流/限速、能力探测）
+│   ├── cache/                    精确响应缓存（按请求体哈希）
+│   ├── client/                   WindsurfClient（Cascade 流程 + 停滞保护）
+│   ├── cloud/                    Codeium REST（GetUserStatus 等）
+│   ├── config/                   .env + 类型化配置
+│   ├── convpool/                 Cascade 对话 ID 复用池
+│   ├── dashapi/                  /dashboard/api/* 全部路由
+│   ├── firebase/                 Firebase 登录 / 令牌刷新 / 再注册
+│   ├── grpcx/                    HTTP/2 gRPC 单次 + 流式（h2c）
+│   ├── langserver/               Language Server 进程池（一代理一实例）
+│   ├── logx/                     环形缓冲 + SSE 广播 + JSONL 日志滚动
+│   ├── modelaccess/              全局模型白/黑名单
+│   ├── models/                   模型目录（120+ 条）+ 层级访问表
+│   ├── pbenc/                    零依赖 protobuf 编解码
+│   ├── proxycfg/                 全局 + 账号级 HTTP/HTTPS/SOCKS5 代理
+│   ├── runtimecfg/               运行时配置（实验性开关 + 身份提示模板）
+│   ├── sanitize/                 流式路径脱敏（/tmp/windsurf-workspace）
+│   ├── server/                   HTTP 路由 + chat / messages / 探测
+│   ├── stats/                    每模型 / 每账号 / 72h 桶 + p50/p95
+│   ├── toolemu/                  OpenAI tools[] ↔ Cascade 文本协议模拟
+│   ├── web/                      内嵌前端（Vite 构建产物 + //go:embed）
+│   └── windsurf/                 Cascade + Legacy 协议 builder/parser
+├── web/                          Vue 3 前端源码
+│   ├── src/
+│   │   ├── api/                  统一请求封装 + 按资源拆分
+│   │   ├── components/           可复用组件
+│   │   ├── composables/          组合函数（Firebase OAuth 等）
+│   │   ├── layouts/              BasicLayout（sider + drawer 自适应）
+│   │   ├── router/               路由 + 守卫
+│   │   ├── stores/               Pinia 状态
+│   │   ├── styles/               全局主题
+│   │   └── views/                9 个业务页
+│   ├── package.json
+│   └── vite.config.ts
+├── bin/language_server_linux_x64 Windsurf 官方 Language Server 二进制
+├── go.mod / go.sum
+├── .env.example                  环境变量模板
+└── docs/                         完整文档
 ```
 
-## Performance notes (JS vs Go)
+## 性能与 JS 版对比
 
-| | Node.js | Go |
+| | Node.js 原版 | Go 重写版 |
 |---|---|---|
-| Static binary | — (needs Node + `/opt/windsurf`) | 11.8 MB single file |
-| Idle RSS | 70–90 MB | 10–15 MB |
-| Concurrency | single event loop | goroutines + per-request context |
-| Protobuf alloc | `Buffer.concat` repeated copies | `append([]byte, …)` one outer alloc |
-| gRPC conn | `http2.connect` per poll | `http2.Transport` pool reuse |
-| SSE throughput | Node Writable stream intermediate buffers | direct `http.Flusher` — no middlemen |
-| Path sanitize | regex ReplaceAll per chunk | stream-safe `Stream` with holdLen tail |
+| 分发产物 | Node 运行时 + 源码目录 | 单个静态二进制（约 9 MB） |
+| 空载内存 | 70 – 90 MB | 10 – 15 MB |
+| 并发模型 | 单事件循环 | 协程 + 每请求 context |
+| protobuf 分配 | `Buffer.concat` 重复拷贝 | `append([]byte, …)` 单次外层分配 |
+| gRPC 连接 | 每次轮询新建 | `http2.Transport` 连接池 |
+| SSE 吞吐 | Node Writable 中间缓冲 | 直接 `http.Flusher` |
+| 路径脱敏 | 每 chunk 正则 replaceAll | 流式带尾部保留的 `Stream` |
 
-## Parity with JS
+## 与上游 Windsurf 的兼容要点
 
-The Go port mirrors the JS service's externally observable behaviour —
-including the well-documented gotchas from the JS `CLAUDE.md`:
+- `planner_mode = NO_TOOL (3)`，并对 `CascadeConversationalPlannerConfig` 字段 10/12/13 加三条 `SectionOverrideConfig` 覆盖 —— 关闭 Cascade 内置的 IDE 代理回路，避免 `stall_warm` 伪阳性、`/tmp/windsurf-workspace` 路径泄露、文件冲突
+- 同时发送 `requested_model_uid`（字段 35）和弃用的 enum（字段 15 / ModelOrAlias.字段 1）—— 用户状态为空时两者缺一会被上游拒
+- 流式中优先 `responseText`，只在空闲时用 `modifiedText` 做前缀扩展补齐
+- 冷启动停滞阈值 `30s + ⌊chars/1500⌋·5s`，封顶 180s
+- 热启动停滞：25s 无进度 → 已输出 <300 字符则重试，否则接受当前结果
+- 账号信号分流：限速 / `permission_denied` / `failed_precondition` / `internal error` 各走隔离路径，只有真实认证失败才扣错误预算
+- 限速窗口**持久化**到 `accounts.json`，重启不丢
+- Firebase API Key `AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY` 为官方固定值，不要轮换
+- Linux 启动时擦除 `/tmp/windsurf-workspace/*`
+- Dashboard 密码未设置时回退到 `API_KEY`
 
-- `planner_mode = NO_TOOL (3)` + three `SectionOverrideConfig` overrides on
-  fields 10/12/13 of `CascadeConversationalPlannerConfig`.
-- Both `requested_model_uid` (field 35) AND the deprecated enum via field
-  15 / field 1 of the ModelOrAlias message — needed when user status is nil.
-- `responseText` preferred over `modifiedText` mid-stream; `modifiedText`
-  top-up at idle only when it's a strict prefix extension.
-- Cold-stall threshold = `30 s + ⌊chars/1500⌋·5 s` capped at 180 s.
-- Warm-stall: 25 s no progress → retry when <300 chars yielded, accept
-  otherwise.
-- Account signalling: rate-limit / permission_denied / failed_precondition
-  / `internal error occurred` each routed to their own quarantine path —
-  only real auth failures decrement the error budget.
-- Firebase API key `AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY` — the three
-  alternatives listed in `CLAUDE.md` are confirmed non-functional; **don't
-  rotate**.
-- Workspace wipe at boot on Linux.
-- Dashboard password fallback to API key when unset.
-- OpenAI-shape `prompt_tokens = input + cacheRead + cacheWrite`; Anthropic
-  bridge surfaces `cache_creation_input_tokens` + `cache_read_input_tokens`
-  separately.
+## 已知限制
 
-## Non-goals / known stubs
+- **`modelIdentityPrompt` 对 grok 模型无效**：grok 的 RLHF 偏见会让模型回"我是 Cascade"。该开关默认开启，因为它让 Claude 的身份更稳固，但 grok 会偶发无视指令。需要纯净身份时请把 `DEFAULT_MODEL` 换成 `claude-4.5-haiku`（1x 额度，身份稳定），或在控制台实验性功能面板把 `modelIdentityPrompt` 关闭
+- **Firebase OAuth 受来源域限制**：Google / GitHub 一键登录依赖 Firebase Auth，后者只允许 `windsurf.com` 和 `localhost` 作为来源。自建 IP 部署时走 SSH 隧道 `ssh -L 3003:localhost:3003` 后从 `http://localhost:3003/dashboard` 访问即可
+- **自更新**：只执行 `git pull` + `os.Exit(0)`，依赖 systemd / PM2 等进程管理器自动拉起
 
-- PM2 / systemd supervision is external — self-update does an orderly
-  `os.Exit(0)` and relies on the supervisor to relaunch, identical to the
-  JS version.
-- Firebase sign-in uses the exact hard-coded API key — OAuth Google/GitHub
-  flows come in through the dashboard front-end (which posts the Firebase
-  idToken to `/dashboard/api/oauth-login`).
-- `preflightRateLimit` adds one REST round-trip per chat attempt; off by
-  default to match JS.
+## 协议
 
-## Known limitation: `modelIdentityPrompt` on grok models
+与 JS 原仓一致：非商业 / 非转售 / 非中转。未经书面许可不得用于商业发行。
 
-The experimental flag injects an identity instruction at three levels
-(`SendUserCascadeMessageRequest` fields 8 / 13 + a system-role message),
-telling the model to self-identify as the requested model name. Live
-testing:
+## 上游
 
-| Model family | Override effective? | Notes |
-|---|---|---|
-| `claude-*` | ✅ yes | Claude's RLHF weights system-prompt identity highly — the model correctly says "I am claude-opus-4.6, made by Anthropic". |
-| `grok-3*` | ❌ no | Grok's baked-in "I am Cascade" reply survives. The model's reasoning trace explicitly acknowledges our instruction ("user asks me to say I am grok-3-mini-thinking") then discards it. This is a grok RLHF bias, not an injection path weakness. |
-| Others (gpt, gemini, glm, kimi, deepseek, …) | Untested — likely varies by model family |
-
-The injection stays on (`modelIdentityPrompt=true` by default) because it
-strengthens Claude identity without harming grok behaviour. **If your
-default model is `grok-*`**, expect the model to occasionally self-identify
-as "Cascade" — this is a known, accepted limitation. Work-arounds if it
-matters:
-
-- Switch `DEFAULT_MODEL` to `claude-4.5-haiku` (1x credit, identity-stable)
-  or `claude-sonnet-4.6` (4x credit).
-- Set `modelIdentityPrompt=false` via the dashboard's experimental panel
-  if you'd rather the model use whatever its natural identity string is.
-
-## License
-
-Same terms as the JS repo — see the root README. No commercial / relay /
-resale use without written permission.
+- JS 原版：https://github.com/dwgx/WindsurfAPI
+- 本 Go 重写版仓库：https://cnb.cool/Neko_Kernel/Windsurf_To_API_Go
