@@ -28,6 +28,10 @@ type ChatMsg struct {
 	Content       string
 	ToolCallsText string // rendered prior tool_calls (see handlers/chat)
 	ToolCallID    string // for role=tool
+	// Images carries base64-encoded inline images for this turn. Surfaced to
+	// Cascade via SendUserCascadeMessageRequest.images (proto field 6); legacy
+	// RawGetChatMessage has no equivalent field and silently drops them.
+	Images []windsurf.ImageData
 }
 
 // Chunk is one incremental step produced during a cascade poll.
@@ -233,11 +237,22 @@ func (c *Client) CascadeChat(ctx context.Context, msgs []ChatMsg, modelEnum uint
 	// forwards the latest user message.
 	text := assemblePayload(msgs, opts.ReuseEntry != nil && opts.ReuseEntry.CascadeID != "")
 
+	// Images from the latest user turn (earlier turns are already encoded
+	// into assemblePayload text; the Cascade image field only applies to the
+	// outbound turn).
+	var latestImages []windsurf.ImageData
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" && len(msgs[i].Images) > 0 {
+			latestImages = msgs[i].Images
+			break
+		}
+	}
+
 	sendMessage := func() error {
 		proto := windsurf.BuildSendCascadeMessageRequest(c.APIKey, cascadeID, text, modelEnum, modelUID, sessionID, windsurf.SendOpts{
 			ToolPreamble:   opts.ToolPreamble,
 			IdentityPrompt: opts.IdentityPrompt,
-		})
+		}, latestImages)
 		_, err := c.conn.Unary(ctx, lsService+"/SendUserCascadeMessage", grpcx.Frame(proto), 0)
 		return err
 	}

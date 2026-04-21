@@ -21,6 +21,7 @@ import (
 	"windsurfapi/internal/client"
 	"windsurfapi/internal/cloud"
 	"windsurfapi/internal/convpool"
+	"windsurfapi/internal/imagex"
 	"windsurfapi/internal/logx"
 	"windsurfapi/internal/modelaccess"
 	"windsurfapi/internal/models"
@@ -147,14 +148,24 @@ func (d *Deps) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var cascadeMsgs []client.ChatMsg
 	var legacyMsgs []client.ChatMsg
 	if emulateTools {
-		for _, nm := range toolemu.Normalize(body.Messages) {
-			cascadeMsgs = append(cascadeMsgs, client.ChatMsg{Role: nm.Role, Content: nm.Content})
+		normalised := toolemu.Normalize(body.Messages)
+		for i, nm := range normalised {
+			msg := client.ChatMsg{Role: nm.Role, Content: nm.Content}
+			// Normalize re-shuffles tool-typed turns but preserves array order
+			// among non-tool ones, so the image payload on OAIMessage i still
+			// maps to the NormalMessage at the same index for user turns.
+			// Pull them back in by index so vision works under emulateTools too.
+			if i < len(body.Messages) && nm.Role == body.Messages[i].Role {
+				msg.Images = extractImages(body.Messages[i].Content)
+			}
+			cascadeMsgs = append(cascadeMsgs, msg)
 		}
 	}
 	for _, m := range body.Messages {
 		msg := client.ChatMsg{
 			Role:    m.Role,
 			Content: contentToString(m.Content),
+			Images:  extractImages(m.Content),
 		}
 		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
 			var lines []string
@@ -1006,6 +1017,69 @@ func chunkFinish(in streamInput, reason string, usage *usageBody) map[string]any
 func rawFromTools(t []toolemu.Tool) json.RawMessage {
 	b, _ := json.Marshal(t)
 	return b
+}
+
+// extractImages walks an OpenAI-style content array and pulls every
+// `image_url` block through imagex.Resolve. Returns nil when the payload
+// is a plain string (common case — hot path stays allocation-free).
+// Failures are logged at DEBUG and skipped; we never refuse a request
+// because one image URL couldn't be fetched — the model can still reply
+// to the text portion.
+func extractImages(raw json.RawMessage) []windsurf.ImageData {
+	if len(raw) == 0 || raw[0] != '[' {
+		return nil
+	}
+	var arr []struct {
+		Type     string `json:"type"`
+		ImageURL *struct {
+			URL string `json:"url"`
+		} `json:"image_url,omitempty"`
+		// Anthropic-shaped image block, in case a client routes its
+		// /v1/messages payload through /v1/chat/completions by mistake.
+		Source *struct {
+			Type      string `json:"type"`
+			MediaType string `json:"media_type"`
+			Data      string `json:"data"`
+		} `json:"source,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return nil
+	}
+	var out []windsurf.ImageData
+	for _, p := range arr {
+		switch p.Type {
+		case "image_url":
+			if p.ImageURL == nil || p.ImageURL.URL == "" {
+				continue
+			}
+			im, err := imagex.Resolve(p.ImageURL.URL)
+			if err != nil {
+				logx.Debug("image_url skipped: %s", err.Error())
+				continue
+			}
+			if im != nil {
+				out = append(out, windsurf.ImageData{Base64: im.Base64, Mime: im.Mime})
+			}
+		case "image":
+			if p.Source == nil {
+				continue
+			}
+			if p.Source.Type == "base64" && p.Source.Data != "" {
+				out = append(out, windsurf.ImageData{
+					Base64: p.Source.Data,
+					Mime:   orDefault(p.Source.MediaType, "image/png"),
+				})
+			}
+		}
+	}
+	return out
+}
+
+func orDefault(s, d string) string {
+	if s == "" {
+		return d
+	}
+	return s
 }
 
 func contentToString(raw json.RawMessage) string {

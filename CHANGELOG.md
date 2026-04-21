@@ -2,6 +2,42 @@
 
 所有有意义的变更都会记录在本文件。版本采用 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.1-go] — 2026-04-22
+
+上游 JS 仓 (`dwgx/WindsurfAPI`) 近期提交的 backport。对照 78 条 commits 做了能力缺口审计，吸收对 Go 反代有意义的增量。
+
+### 新增
+
+- **图片 / 视觉输入（backport `fad32d3` + `1f98fff` + `ee3c413`）**
+  - 新模块 `internal/imagex`：把 `data:image/...;base64,...` data URL、远程 `https?://` URL、裸 base64 三种客户端输入形态归一成 `{Base64, Mime}`
+  - 远程抓取走 SSRF 白名单：拒绝 `127/10/172.16-31/192.168/169.254/100.64/fe80/fc00` 及 `localhost`/`.local`/`.internal`/`metadata.*`；每次 redirect 重新校验目标避免 302 绕过；3 跳上限；5 MB 解码大小上限；严格 https/http 协议
+  - `SendUserCascadeMessageRequest.images` proto field 6（repeated `ImageData{base64_data=1 string, mime_type=2 string}`）。`base64_data` 用 string 而非 bytes（raw bytes 触发 LS "string field contains invalid UTF-8"，已在上游 740ad6d 验证）
+  - **有图片时 planner_mode 从 NO_TOOL(3) 切回 DEFAULT(1)**——NO_TOOL 下视觉管线不启用，图片会被 LS 默默丢弃（上游 1f98fff 验证）；无图片时维持 NO_TOOL 保留本项目现有反射性工具回路抑制
+  - OpenAI 端：`/v1/chat/completions` 识别 `content: [{type:"image_url", image_url:{url:"..."}}]` 形态
+  - Anthropic 端：`/v1/messages` 识别 `{type:"image", source:{type:"base64", media_type, data}}`，内部翻译时转成 OpenAI 形态，`extractImages()` 一个口子走通
+- **官方 dated 模型别名（backport `efcb713` + `a6376f8`）**
+  - `claude-opus-4-5-20251101` / `claude-sonnet-4-5-20251101` / `claude-3-7-sonnet-20250219` / `claude-3-5-sonnet-20241022` 等 Anthropic SDK 固定写法自动解析到短名
+  - `gpt-4o-2024-08-06` / `gpt-4.1-2025-04-14` / `gpt-5-2025-08-07` 等 OpenAI SDK dated snapshot 全量覆盖
+  - `-latest` / `-0` / Claude 4.7 `claude-opus-4-7` → `claude-opus-4-7-medium` 默认变体
+  - 未命中目录的别名自动跳过（不污染 Resolve），防止云端模型还没 merge 进来时 dangling key
+- **gRPC 多帧响应解析（backport `13c72a0` / `f9678ae`）**
+  - 新增 `grpcx.ExtractFrames`：遍历并拼接所有 length-prefixed 帧的 payload。原 `StripFrame` 只处理首帧，遇到 LS 偶尔把大 trajectory 响应切到 2+ 帧时会静默截断。单帧响应行为不变
+
+### 审计对齐
+
+对照上游 `8f1b50e / fe4ddb1 / 9fad3ac / d02efc3 / 05e8519 / 2c993b9 / 3a45f56 / 7f339b5 / b7937b0 / ef21ff7` 等关键协议 / 账号逻辑修复，确认 Go 端已覆盖：
+- ✅ CascadeConversationalPlannerConfig 四字段同时填（plan_model_deprecated 1 / requested_model_deprecated 15 / plan_model_uid 34 / requested_model_uid 35）
+- ✅ Legacy RawGetChatMessage 的 assistant 编码走 ChatMessage.action(6) → ChatMessageAction.generic(1) → ChatMessageActionGeneric.text(1)
+- ✅ role=tool 降级 "[tool result for X]: ..."、assistant.tool_calls 降级 "[called tool X with Y]"
+- ✅ planner_mode=NO_TOOL(3) + tool_calling_section(10) + additional_instructions_section(12) 双层 section override
+- ✅ per-model 限流（`ModelRateLimits` + `ModelRateStarted`，持久化）
+- ✅ LS per-proxy pool，`getLsFor` 不 fallback default
+- ✅ 动态账号重试上限 `clamp(active, 3, streamMaxTries=10)`
+- ✅ gRPC 连接错误不累计账号错误计数
+- ✅ Firebase 50 分钟周期 refresh
+- ✅ SIGTERM 前原子落盘（`signal.NotifyContext` + 优雅关停，`auth` 包的 saveLocked 保证持久化）
+- ✅ `/v1/messages` 接受 `x-api-key` 头
+
 ## [1.3.0-go] — 2026-04-22
 
 控制台能力扩展与若干稳定性修复。

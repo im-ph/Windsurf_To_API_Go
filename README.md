@@ -6,7 +6,7 @@
 
 - **语言 / 运行时**：Go ≥ 1.26.2，静态编译，Linux amd64 产物约 13 MB（含内嵌 Vue SPA）
 - **内嵌前端**：Vue 3 + TypeScript + Ant Design Vue 4，`//go:embed` 打入二进制
-- **兼容协议**：OpenAI `/v1/chat/completions` + Anthropic `/v1/messages`（原生 SSE 透传）
+- **兼容协议**：OpenAI `/v1/chat/completions` + Anthropic `/v1/messages`（原生 SSE 透传，支持图片输入）
 - **账号池**：分层 RPM 加权调度、按模型级别的限速/限流隔离、Firebase 令牌自动刷新
 - **控制台**：9 个页面（仪表盘 / 统计分析 / 登录取号 / 账号管理 / 异常监测 / 模型控制 / 代理配置 / 运行日志 / 实验性功能），支持实时系统指标、模型能力清单、Token 消耗与等价费用统计
 
@@ -56,7 +56,8 @@ Windsurf_To_API_Go/
 │   ├── convpool/                 Cascade 对话 ID 复用池
 │   ├── dashapi/                  /dashboard/api/* 全部路由
 │   ├── firebase/                 Firebase 登录 / 令牌刷新 / 再注册
-│   ├── grpcx/                    HTTP/2 gRPC 单次 + 流式（h2c）
+│   ├── grpcx/                    HTTP/2 gRPC 单次 + 流式（h2c，多帧响应自动拼接）
+│   ├── imagex/                   图片输入处理（data URL / 远程 URL / 裸 base64，SSRF 白名单）
 │   ├── langserver/               Language Server 进程池（一代理一实例）
 │   ├── logx/                     环形缓冲 + SSE 广播 + JSONL 日志滚动
 │   ├── modelaccess/              全局模型白/黑名单

@@ -190,6 +190,7 @@ func anthropicToOpenAIRequest(in anthropicRequest) (openAIRequest, error) {
 			role = "user"
 		}
 		var textParts []string
+		var imageBlocks []map[string]any
 		var toolCalls []toolemu.OAIToolCall
 		var toolResults []toolemu.OAIMessage
 
@@ -206,6 +207,34 @@ func anthropicToOpenAIRequest(in anthropicRequest) (openAIRequest, error) {
 						var t string
 						_ = json.Unmarshal(blk["text"], &t)
 						textParts = append(textParts, t)
+					case "image":
+						// Convert Anthropic's {source:{type:"base64",
+						// media_type, data}} into OpenAI's image_url shape so
+						// the downstream chat handler's extractImages picks
+						// it up through the single uniform path.
+						var src struct {
+							Type      string `json:"type"`
+							MediaType string `json:"media_type"`
+							Data      string `json:"data"`
+							URL       string `json:"url"`
+						}
+						_ = json.Unmarshal(blk["source"], &src)
+						var url string
+						if src.Type == "base64" && src.Data != "" {
+							mime := src.MediaType
+							if mime == "" {
+								mime = "image/png"
+							}
+							url = "data:" + mime + ";base64," + src.Data
+						} else if src.Type == "url" && src.URL != "" {
+							url = src.URL
+						}
+						if url != "" {
+							imageBlocks = append(imageBlocks, map[string]any{
+								"type":      "image_url",
+								"image_url": map[string]any{"url": url},
+							})
+						}
 					case "thinking":
 						// Assistant history thinking — skip.
 					case "tool_use":
@@ -254,8 +283,23 @@ func anthropicToOpenAIRequest(in anthropicRequest) (openAIRequest, error) {
 				msg.Content = rc
 			}
 			out.Messages = append(out.Messages, msg)
-		} else if len(textParts) > 0 {
-			rc, _ := json.Marshal(strings.Join(textParts, "\n"))
+		} else if len(textParts) > 0 || len(imageBlocks) > 0 {
+			var rc json.RawMessage
+			if len(imageBlocks) == 0 {
+				rc, _ = json.Marshal(strings.Join(textParts, "\n"))
+			} else {
+				// Mixed text+image — emit OpenAI content-array shape so
+				// extractImages sees the image_url blocks and contentToString
+				// concatenates the text parts.
+				arr := make([]map[string]any, 0, len(textParts)+len(imageBlocks))
+				for _, t := range textParts {
+					if t != "" {
+						arr = append(arr, map[string]any{"type": "text", "text": t})
+					}
+				}
+				arr = append(arr, imageBlocks...)
+				rc, _ = json.Marshal(arr)
+			}
 			out.Messages = append(out.Messages, toolemu.OAIMessage{Role: role, Content: rc})
 		}
 		out.Messages = append(out.Messages, toolResults...)

@@ -41,6 +41,36 @@ func StripFrame(b []byte) []byte {
 	return b
 }
 
+// ExtractFrames walks every length-prefixed gRPC frame in b and concatenates
+// their payloads. The Windsurf LS occasionally chunks a single logical RPC
+// response across multiple frames (observed on large trajectory dumps) —
+// stripping only the first frame loses data silently. Backward compatible
+// with the common single-frame case.
+func ExtractFrames(b []byte) []byte {
+	var out []byte
+	i := 0
+	for i+5 <= len(b) {
+		// Skip compressed frames (flag != 0) — the LS never uses them, and
+		// faithfully decompressing would pull in a gzip dep for no payoff.
+		flag := b[i]
+		n := binary.BigEndian.Uint32(b[i+1 : i+5])
+		if uint32(i+5)+n > uint32(len(b)) {
+			// Truncated frame — return whatever we've accumulated so far.
+			return out
+		}
+		if flag == 0 {
+			out = append(out, b[i+5:i+5+int(n)]...)
+		}
+		i += 5 + int(n)
+	}
+	// If we consumed nothing frame-shaped, fall back to raw body so callers
+	// that were relying on the pre-frame legacy path still see their data.
+	if len(out) == 0 {
+		return StripFrame(b)
+	}
+	return out
+}
+
 // ─── Client ─────────────────────────────────────────────────
 
 // Client is reusable across many requests. One per unique LS port is enough.
@@ -129,7 +159,7 @@ func (c *Client) Unary(ctx context.Context, path string, body []byte, timeout ti
 		}
 		return nil, fmt.Errorf("%s", msg)
 	}
-	return StripFrame(raw), nil
+	return ExtractFrames(raw), nil
 }
 
 // StreamFrame is one decoded frame on the wire.

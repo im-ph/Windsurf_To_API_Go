@@ -240,25 +240,53 @@ type SendOpts struct {
 	IdentityPrompt string
 }
 
-func BuildSendCascadeMessageRequest(apiKey, cascadeID, text string, modelEnum uint64, modelUID, sessionID string, opts SendOpts) []byte {
+// ImageData mirrors exa.cortex_pb.ImageData on the wire —
+//   field 1: base64_data (string, NOT bytes — raw bytes triggers "string
+//            field contains invalid UTF-8" because the LS treats field 1
+//            as a proto string type, verified in JS repo commit 740ad6d)
+//   field 2: mime_type (string, e.g. "image/png")
+type ImageData struct {
+	Base64 string
+	Mime   string
+}
+
+func BuildSendCascadeMessageRequest(apiKey, cascadeID, text string, modelEnum uint64, modelUID, sessionID string, opts SendOpts, images []ImageData) []byte {
 	var out []byte
 	out = pbenc.AppendStringField(out, 1, cascadeID)
 	// TextOrScopeItem { text = 1 }
 	textItem := pbenc.AppendStringField(nil, 1, text)
 	out = pbenc.AppendMessageField(out, 2, textItem)
 	out = pbenc.AppendMessageField(out, 3, BuildMetadata(apiKey, sessionID))
-	out = pbenc.AppendMessageField(out, 5, buildCascadeConfig(modelEnum, modelUID, opts))
+	out = pbenc.AppendMessageField(out, 5, buildCascadeConfig(modelEnum, modelUID, opts, len(images) > 0))
+	// Images live on field 6 as `repeated ImageData` — omit entirely when
+	// empty so non-vision requests stay byte-identical to the pre-vision
+	// builder (upstream won't complain either way).
+	for _, im := range images {
+		var pi []byte
+		pi = pbenc.AppendStringField(pi, 1, im.Base64)
+		pi = pbenc.AppendStringField(pi, 2, im.Mime)
+		out = pbenc.AppendMessageField(out, 6, pi)
+	}
 	return out
 }
 
 // buildCascadeConfig mirrors the JS counterpart bit-for-bit. See the giant
 // comment in src/windsurf.js for context; the field numbers and override
 // modes were verified by hand against the binary's FileDescriptorProto.
-func buildCascadeConfig(modelEnum uint64, modelUID string, opts SendOpts) []byte {
+//
+// hasImages switches planner_mode from NO_TOOL (3) back to DEFAULT (1) —
+// the vision pipeline inside Cascade is only wired up under DEFAULT. JS
+// commit 1f98fff verified that staying on NO_TOOL drops the images before
+// they reach the model and the reply ignores them entirely.
+func buildCascadeConfig(modelEnum uint64, modelUID string, opts SendOpts, hasImages bool) []byte {
 	// Inner conversational config.
 	var conv []byte
-	// planner_mode = NO_TOOL (3)
-	conv = pbenc.AppendVarintField(conv, 4, 3)
+	// planner_mode = NO_TOOL (3) by default, DEFAULT (1) when images attached.
+	mode := uint64(3)
+	if hasImages {
+		mode = 1
+	}
+	conv = pbenc.AppendVarintField(conv, 4, mode)
 
 	// field 8 test_section_content (plain string, top of system prompt).
 	// IMPORTANT: field 8 is a string, NOT a SectionOverrideConfig. Writing a
