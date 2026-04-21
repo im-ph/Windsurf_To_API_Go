@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 
+	"windsurfapi/internal/atomicfile"
 	"windsurfapi/internal/langserver"
 )
 
@@ -45,12 +46,9 @@ func save() {
 		return
 	}
 	// Atomic write: write to a temp file then rename — consistent with
-	// auth.pool.saveLocked() so a mid-write crash never corrupts the config.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, path)
+	// atomicfile.Write gives us a per-call unique tmp name + 0o600 mode so
+	// two concurrent save() calls can't clobber each other's .tmp draft.
+	_ = atomicfile.Write(path, data)
 }
 
 // Get returns the full proxy snapshot for the dashboard.

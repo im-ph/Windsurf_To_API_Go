@@ -2,6 +2,33 @@
 
 所有有意义的变更都会记录在本文件。版本采用 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.3-go] — 2026-04-22
+
+生产上线前的安全审计批次 —— 外部审计代理扫出的 13 条 CRITICAL / HIGH / MEDIUM 问题全部修完。
+
+### 安全 (Security)
+
+- **CRIT-1: `/auth/accounts` / `/auth/login` 未鉴权**（[server.go](internal/server/server.go)）—— 以前**任何匿名请求都能枚举邮箱/层级/keyPrefix 并 DELETE 任意账号**。现在与 `/v1/*` 一样挂在 `authMiddleware` 下，`/auth/status` 保持开放（只返回计数，不含标识）
+- **CRIT-2: 账号池并发 save 互相覆盖**（[atomicfile](internal/atomicfile/atomicfile.go) 新增包）—— 旧版 5 个持久化路径共用硬编码 `<path>.tmp`，50min Firebase 循环 / 15min credits 循环 / dashboard POST 同时触发 save 时会交错写进同一个 `.tmp`，rename 后 `accounts.json` 变损坏 JSON，下次启动整池失联。改用 `crypto/rand` 生成每次调用唯一 tmp 名（`accounts.json.<hex>.tmp`），5 处（`auth/pool`、`proxycfg`、`modelaccess`、`runtimecfg`、`stats`）统一走 `atomicfile.Write(path, data)`，同时把权限统一到 0o600
+- **CRIT-1: 账号池并发 map 读写崩溃**（[auth/pool.go cloneAccount](internal/auth/pool.go)）—— `All()`/`Get()` 以前用 `cp := *a` 浅拷贝，`Capabilities/BlockedModels/ModelRateLimits/ModelRateStarted` map/slice 字段仍指向池里活对象。dashboard 在持锁外遍历这些 map，同时 probe/markRateLimited 持锁写同一 map，触发 Go runtime 的 `fatal error: concurrent map read and map write` —— **进程直接崩溃不可恢复**。改成显式 `cloneAccount()` 深拷贝全部 map/slice
+- **HIGH-4: 图片 URL SSRF DNS rebinding**（[imagex.go fetchURL](internal/imagex/imagex.go)）—— 旧版只校验 URL 里字面 host，`evil.example.com` 解析到 `169.254.169.254` 照样拨号。新 `safeDial` 走自定义 `net.Resolver.LookupIP` → 对每个返回 IP 跑 `isPrivateIP` → 拨号钉到第一个通过校验的 IP（不让 happy-eyeballs 替换成没校验过的 IP）
+- **HIGH-14: LS adoption 用错 CSRF**（[langserver/pool.go](internal/langserver/pool.go) + [kill_linux.go](internal/langserver/kill_linux.go) 新增）—— 旧版在启动时发现 42100 端口被占用就直接 "adopt"，但每次进程启动都重算 `DefaultCSRF`，**被领养的 LS 使用旧进程的 CSRF**，随后所有 gRPC 调用都 `permission_denied`，整池失服。改成：扫 `/proc/net/tcp{,6}` + `/proc/*/fd` 找到占端口的 PID 后 `SIGKILL`，等 2 秒端口释放后再用**当前进程的 CSRF** 正常 spawn。非 Linux 平台走 build tag no-op
+- **HIGH-19: API Key / 密码定时攻击**（[server.go authMiddleware](internal/server/server.go) + [dashapi.go secretEqual](internal/dashapi/dashapi.go)）—— `==` 字符串比较可通过网络 RTT 逐字节爆破。改成 `crypto/subtle.ConstantTimeCompare` + 长度预检，空密码/不配置场景显式 false
+- **HIGH-11: `writeJSON` 覆盖 CORS 白名单**（[dashapi.go](internal/dashapi/dashapi.go)）—— `writeJSON` 硬写 `Access-Control-Allow-Origin: *`，**把 `CORS_ALLOWED_ORIGINS` 配置整个作废**。改成删除硬编码，让外层 `cors()` 中间件的白名单生效
+- **HIGH-13: `SetStatus` 未校验输入**（[auth/pool.go validStatus](internal/auth/pool.go)）—— 以前 dashboard PATCH 可以把账号写成任意字符串（"hacked"）导致 `StatusActive` 判断永远跳过。现在只接受 `active/error/disabled/expired/invalid` 5 值白名单
+- **HIGH-26: 请求体 32MB → 8MB**（[chat.go](internal/server/chat.go) + [messages.go](internal/server/messages.go)）—— 1GB VM 上 30 个并发 32MB body 可触发 OOM。图片走 imagex 5MB 独立通道，8MB body 足够所有真实请求
+- **HIGH-34: LS 启动日志包含代理密码**（[langserver/pool.go proxyLabel](internal/langserver/pool.go)）—— 旧版写 `proxy=http://user:pass@host:port` 到 `logs/app-*.jsonl`。新 `proxyLabel()` 只保留 `host:port`，credentials 不落盘
+- **HIGH-15: git argv 防 `-` 前缀 ref 注入**（[dashapi.go selfUpdate](internal/dashapi/dashapi.go)）—— `git fetch origin <branch>` / `git reset --hard origin/<branch>` 全改成 `... -- <branch>` 加选项终止符，缓解 CVE-2018-17456 类。`git pull` 同理
+- **MED-20: `/v1/messages` 异常响应 index-out-of-range panic**（[messages.go](internal/server/messages.go) `openAIToAnthropicResponse`）—— 空 `Choices` 切片直接 `[0]` 崩服务。加 `len == 0` 兜底返回空 assistant turn
+
+### 并发 / 稳定性
+
+- **HIGH-6: `Periodic` WaitGroup race**（[auth/ops.go](internal/auth/ops.go)）—— 旧版 credits / firebase 循环在已启动的 goroutine 内再 `wg.Add(1)`，违反 `sync.WaitGroup` 文档（"Add calls must happen before Wait"）。Add 被提到 spawn 之前，`wg.Add(2)` 一次性涵盖"立即跑"+"定时跑"两个 goroutine
+
+### 文档
+
+- [ENV_VARS.md](docs/ENV_VARS.md) 新增**响应缓存**章节，已在 1.3.2 提到；本版本不变
+
 ## [1.3.2-go] — 2026-04-22
 
 运行时资源调整与控制台可读性改进。

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"windsurfapi/internal/atomicfile"
 	"windsurfapi/internal/logx"
 )
 
@@ -79,7 +80,7 @@ func persist() {
 		logx.Warn("runtime-config: marshal: %s", err.Error())
 		return
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := atomicfile.Write(path, data); err != nil {
 		logx.Warn("runtime-config: write: %s", err.Error())
 	}
 }

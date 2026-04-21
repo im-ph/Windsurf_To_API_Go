@@ -4,6 +4,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"path"
@@ -33,10 +34,17 @@ func Handler(d *Deps) http.Handler {
 	mux := http.NewServeMux()
 
 	// /health is open; everything else goes through validateAPIKey.
+	// /auth/status is also left open because the dashboard and external
+	// monitors poll it for "is there any active account at all" — the
+	// response carries only counts, not identifiers.
 	mux.HandleFunc("/health", d.Health)
 	mux.HandleFunc("/auth/status", d.AuthStatus)
-	mux.HandleFunc("/auth/accounts", d.AuthAccounts)
-	mux.HandleFunc("/auth/login", d.AuthLogin)
+	// /auth/accounts and /auth/login were historically open — that let
+	// anyone on the network enumerate emails / tier / keyPrefix and add or
+	// delete accounts without the operator's API key. Gate them both.
+	mux.Handle("/auth/accounts", d.authMiddleware(http.HandlerFunc(d.AuthAccounts)))
+	mux.Handle("/auth/accounts/", d.authMiddleware(http.HandlerFunc(d.AuthAccounts)))
+	mux.Handle("/auth/login", d.authMiddleware(http.HandlerFunc(d.AuthLogin)))
 
 	mux.Handle("/v1/models", d.authMiddleware(http.HandlerFunc(d.ModelsList)))
 	mux.Handle("/v1/chat/completions", d.authMiddleware(http.HandlerFunc(d.ChatCompletions)))
@@ -175,7 +183,13 @@ func (d *Deps) authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if bearerToken(r) != d.Cfg.APIKey {
+		// Constant-time comparison blocks the classic timing-oracle byte-by-byte
+		// API-key recovery. subtle.ConstantTimeCompare also guards against the
+		// length side-channel by returning 0 for different-length inputs before
+		// looking at bytes.
+		tok := bearerToken(r)
+		want := d.Cfg.APIKey
+		if len(tok) != len(want) || subtle.ConstantTimeCompare([]byte(tok), []byte(want)) != 1 {
 			writeJSON(w, http.StatusUnauthorized, errBody("Invalid API key", "auth_error"))
 			return
 		}

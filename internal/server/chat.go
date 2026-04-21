@@ -62,7 +62,10 @@ func (d *Deps) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			errBody("No active accounts. POST /auth/login to add accounts.", "auth_error"))
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 32<<20) // 32 MB cap
+	// 8 MB cap — the old 32 MB let 30 concurrent callers OOM a 1 GB VM.
+	// Remote images go through imagex (5 MB/image ceiling) and their base64
+	// fits comfortably inside this, so no realistic request gets truncated.
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<20)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("body read failed", "invalid_request"))

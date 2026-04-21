@@ -336,13 +336,19 @@ func (p *Pool) Periodic(ctx context.Context, resolve proxyResolver, probe ProbeF
 		}
 	}()
 
-	wg.Add(1)
+	// Credits refresh — immediate kick + 15-minute tick. The earlier layout
+	// called `wg.Add(1)` from *inside* an already-running goroutine, which
+	// sync.WaitGroup explicitly forbids ("Add calls with a positive delta
+	// that occur when the counter is zero must happen before a Wait"). With
+	// Go's race detector enabled it reports a data race; without it, the
+	// undefined behaviour surfaces as `cancel()` returning while the "kick"
+	// goroutine is still running (and potentially writing to accounts.json
+	// after main exited). Fix: hoist both Add(1) calls above the spawn so
+	// the counter is non-zero before any Wait could observe it.
+	wg.Add(2)
+	go func() { defer wg.Done(); p.RefreshAllCredits(resolve) }()
 	go func() {
 		defer wg.Done()
-		// Run an immediate refresh in the background, but track it in the WaitGroup
-		// so Periodic's cancel func waits for it to finish before returning.
-		wg.Add(1)
-		go func() { defer wg.Done(); p.RefreshAllCredits(resolve) }()
 		t := time.NewTicker(15 * time.Minute)
 		defer t.Stop()
 		for {
@@ -355,11 +361,11 @@ func (p *Pool) Periodic(ctx context.Context, resolve proxyResolver, probe ProbeF
 		}
 	}()
 
-	wg.Add(1)
+	// Firebase refresh — same hoisted-Add pattern.
+	wg.Add(2)
+	go func() { defer wg.Done(); p.RefreshFirebase(resolve) }()
 	go func() {
 		defer wg.Done()
-		wg.Add(1)
-		go func() { defer wg.Done(); p.RefreshFirebase(resolve) }()
 		t := time.NewTicker(50 * time.Minute)
 		defer t.Stop()
 		for {

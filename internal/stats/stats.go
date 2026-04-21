@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"windsurfapi/internal/atomicfile"
 	"windsurfapi/internal/models"
 )
 
@@ -98,7 +99,7 @@ func scheduleSave() {
 		mu.Lock()
 		data, _ := json.MarshalIndent(&state, "", "  ")
 		mu.Unlock()
-		_ = os.WriteFile(path, data, 0o644)
+		_ = atomicfile.Write(path, data)
 	})
 }
 

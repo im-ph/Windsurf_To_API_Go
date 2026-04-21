@@ -48,7 +48,8 @@ cp .env.example .env
 Windsurf_To_API_Go/
 ├── cmd/windsurfapi/main.go       程序入口
 ├── internal/
-│   ├── auth/                     账号池（分层 RPM、限流/限速、能力探测）
+│   ├── atomicfile/               统一的 per-call 唯一 tmp + 0o600 原子写工具（防并发 save 互相覆盖）
+│   ├── auth/                     账号池（分层 RPM、限流/限速、能力探测；All/Get 深拷贝防 concurrent map race）
 │   ├── cache/                    精确响应缓存（磁盘后端 / 按请求体哈希，默认 /tmp 上 tmpfs → swap 兜底）
 │   ├── client/                   WindsurfClient（Cascade 流程 + 停滞保护）
 │   ├── cloud/                    Codeium REST（GetUserStatus 等）

@@ -31,7 +31,7 @@ func (d *Deps) Messages(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, anthropicErr("No active accounts", "api_error"))
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 32<<20) // 32 MB cap
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<20) // 8 MB cap — matches chat.go
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, anthropicErr("body read failed", "invalid_request_error"))
@@ -358,7 +358,24 @@ var stopMap = map[string]string{
 
 func openAIToAnthropicResponse(in openAIResponse, model, msgID string) map[string]any {
 	var content []any
-	var choice = in.Choices[0]
+	// Defensive: a malformed upstream response (stream aborted immediately,
+	// cache miss path that produced only a role chunk, etc.) could surface
+	// here with an empty Choices slice. Without the guard, `in.Choices[0]`
+	// panics and the whole process dies — we return an empty assistant
+	// turn so the caller sees a well-formed but content-less response.
+	if len(in.Choices) == 0 {
+		return map[string]any{
+			"id":            msgID,
+			"type":          "message",
+			"role":          "assistant",
+			"model":         model,
+			"content":       []any{},
+			"stop_reason":   "end_turn",
+			"stop_sequence": nil,
+			"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
+		}
+	}
+	choice := in.Choices[0]
 	if t := choice.Message.ReasoningContent; t != "" {
 		content = append(content, map[string]any{"type": "thinking", "thinking": t})
 	}

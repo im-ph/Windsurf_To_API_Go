@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
+
+	"windsurfapi/internal/atomicfile"
 )
 
 const (
@@ -44,7 +46,7 @@ func Init() {
 
 func save() {
 	data, _ := json.MarshalIndent(cfg, "", "  ")
-	_ = os.WriteFile(path, data, 0o644)
+	_ = atomicfile.Write(path, data)
 }
 
 // Get returns a copy of the current config. The list is always non-nil so

@@ -7,6 +7,7 @@ package dashapi
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -60,12 +61,22 @@ func (d *Deps) checkAuth(r *http.Request) bool {
 		pw = r.URL.Query().Get("pw")
 	}
 	if d.Cfg.DashboardPassword != "" {
-		return pw == d.Cfg.DashboardPassword
+		return secretEqual(pw, d.Cfg.DashboardPassword)
 	}
 	if d.Cfg.APIKey != "" {
-		return pw == d.Cfg.APIKey
+		return secretEqual(pw, d.Cfg.APIKey)
 	}
 	return true
+}
+
+// secretEqual compares an incoming secret against a reference in constant
+// time. Guards against byte-by-byte timing oracles on network auth; empty
+// inputs always return false (no "no secret configured" bypass).
+func secretEqual(got, want string) bool {
+	if want == "" || len(got) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 func (d *Deps) route(w http.ResponseWriter, r *http.Request) {
@@ -865,11 +876,15 @@ func (d *Deps) selfUpdate(w http.ResponseWriter, body map[string]any) {
 		if branch == "" {
 			branch = "master"
 		}
-		if _, err := runCmd("git", "fetch", "origin", branch); err != nil {
+		// `--` separator terminates option parsing so a branch literal that
+		// happens to start with "-" (e.g. pushed ref `-upload-pack=...`) is
+		// treated as a ref, not a flag. Defence against CVE-2018-17456-class
+		// issues when the repo's HEAD ref name is attacker-controlled.
+		if _, err := runCmd("git", "fetch", "origin", "--", branch); err != nil {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		if _, err := runCmd("git", "reset", "--hard", "origin/"+branch); err != nil {
+		if _, err := runCmd("git", "reset", "--hard", "--", "origin/"+branch); err != nil {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
@@ -880,7 +895,7 @@ func (d *Deps) selfUpdate(w http.ResponseWriter, body map[string]any) {
 	}
 	pullOut := "hard-reset applied"
 	if strings.TrimSpace(dirty) == "" {
-		if out, err := runCmd("git", "pull", "origin", branch, "--ff-only"); err != nil {
+		if out, err := runCmd("git", "pull", "--ff-only", "origin", "--", branch); err != nil {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 			return
 		} else {
@@ -1144,9 +1159,10 @@ func isPrivateIP(ip net.IP) bool {
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Dashboard-Password")
+	// CORS headers are NOT set here — the outer cors() middleware in server.go
+	// owns that policy and honours CORS_ALLOWED_ORIGINS. Setting
+	// "Access-Control-Allow-Origin: *" here previously clobbered the
+	// allowlist, defeating the config.
 	w.WriteHeader(status)
 	if body != nil {
 		_ = json.NewEncoder(w).Encode(body)

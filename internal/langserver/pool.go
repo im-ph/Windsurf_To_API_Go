@@ -158,6 +158,25 @@ func proxyURL(px *Proxy) string {
 	return fmt.Sprintf("http://%s%s:%d", auth, px.Host, port)
 }
 
+// killOrphanOnPort's implementation is platform-specific (kill_linux.go /
+// kill_other.go) because syscall.Kill exists only on Unix. The dispatch
+// here stays small so non-Linux builds compile cleanly.
+
+// proxyLabel is the logger-safe form of proxyURL — just host:port, no
+// credentials. Use this anywhere the output lands in stdout / the ring
+// buffer / log files so a full proxy URL with username:password doesn't end
+// up in a log rotation or SSE stream.
+func proxyLabel(px *Proxy) string {
+	if px == nil || px.Host == "" {
+		return "none"
+	}
+	port := px.Port
+	if port == 0 {
+		port = 8080
+	}
+	return fmt.Sprintf("%s:%d", px.Host, port)
+}
+
 func isPortInUse(port int) bool {
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
 	if err != nil {
@@ -197,46 +216,29 @@ func (p *Pool) Ensure(ctx context.Context, px *Proxy) (*Entry, error) {
 		p.nextPort++
 	}
 
-	// Adopt an already-listening default instance instead of fighting for the port.
+	// Orphan LS on our default port (42100)? The previous "adopt" strategy
+	// attached our fresh DefaultCSRF to somebody else's process — but the
+	// orphan spawned with a DIFFERENT random CSRF, so every gRPC call
+	// returned `permission_denied` and the whole pool failed closed.
+	//
+	// Instead: best-effort evict the squatter and fall through to spawn a
+	// fresh LS under our own CSRF. fuser/pkill aren't in $PATH on minimal
+	// images, so we rely on SO_REUSEADDR from the new process and a short
+	// delay for the kernel to reap the TIME_WAIT — `Ensure`'s spawn path
+	// below will still get the port even if the orphan lingers briefly.
 	if isDefault && isPortInUse(port) {
-		logx.Info("LS default port %d already in use — adopting", port)
-		e := &Entry{Port: port, CSRF: DefaultCSRF, StartedAt: time.Now(), Ready: true, SessionID: windsurf.NewSessionID()}
-		p.entries[key] = e
+		logx.Warn("LS default port %d already in use — orphan likely, trying to free it before spawning", port)
 		p.mu.Unlock()
-		// Watchdog — adopted entries have no Process ref, so there's no
-		// cmd.Wait() goroutine to clean them up. Poll the port every 5s; if
-		// it goes silent for two consecutive checks, purge the stale entry
-		// so the next request re-runs Ensure and spawns a fresh LS instead
-		// of dialling a dead port forever.
-		go func(k string, port int, adopted *Entry) {
-			misses := 0
-			t := time.NewTicker(5 * time.Second)
-			defer t.Stop()
-			for range t.C {
-				p.mu.Lock()
-				cur, ok := p.entries[k]
-				p.mu.Unlock()
-				if !ok || cur != adopted {
-					return // superseded (spawned/restarted) — watchdog is done
-				}
-				if isPortInUse(port) {
-					misses = 0
-					continue
-				}
-				misses++
-				if misses >= 2 {
-					p.mu.Lock()
-					if p.entries[k] == adopted {
-						delete(p.entries, k)
-						logx.Warn("LS adopted instance %s port %d went silent — purging so next request respawns", k, port)
-					}
-					p.mu.Unlock()
-					convpool.InvalidateFor("", port)
-					return
-				}
-			}
-		}(key, port, e)
-		return e, nil
+		killOrphanOnPort(port)
+		// Give the kernel up to 2 s to release the socket.
+		deadline := time.Now().Add(2 * time.Second)
+		for isPortInUse(port) && time.Now().Before(deadline) {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if isPortInUse(port) {
+			return nil, fmt.Errorf("LS port %d still held by an orphan process and could not be freed", port)
+		}
+		p.mu.Lock()
 	}
 	p.mu.Unlock()
 
@@ -344,7 +346,9 @@ func (p *Pool) Ensure(ctx context.Context, px *Proxy) (*Entry, error) {
 	}()
 
 	// Never log the CSRF token (or any prefix) — it's a per-process secret.
-	logx.Info("Starting LS instance key=%s port=%d proxy=%s", key, port, proxyURL(px))
+	// Also never log proxyURL() — it embeds username:password in the URL form.
+	// host:port is enough for operators to tell instances apart.
+	logx.Info("Starting LS instance key=%s port=%d proxy=%s", key, port, proxyLabel(px))
 	p.mu.Lock()
 	p.entries[key] = entry
 	p.mu.Unlock()

@@ -11,6 +11,7 @@
 package imagex
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -113,11 +114,44 @@ func fetchURL(s string, redirectsLeft int) (*Image, error) {
 	if err := validateURL(s); err != nil {
 		return nil, err
 	}
+	// DNS-rebinding defence: validate each resolved IP at dial time rather
+	// than only at URL-parse time. Without this, an attacker-controlled
+	// hostname passes validateURL() (host is `evil.example.com`, not an IP)
+	// yet resolves to `169.254.169.254` / `127.0.0.1` when Go's http
+	// transport actually dials. The CheckRedirect hook alone doesn't help —
+	// it only sees the redirect URL, not the resolved target IP.
+	dialer := &net.Dialer{Timeout: FetchTimeout, KeepAlive: 30 * time.Second}
+	safeDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		ips, err := (&net.Resolver{}).LookupIP(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+		if len(ips) == 0 {
+			return nil, errors.New("image: no IPs for host")
+		}
+		for _, ip := range ips {
+			if isPrivateIP(ip) {
+				return nil, fmt.Errorf("image: refusing to dial private IP %s", ip)
+			}
+		}
+		// Pin dial to the first safe IP so a later happy-eyeballs race can't
+		// swap in an IP we never validated.
+		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+	}
+	transport := &http.Transport{
+		DialContext:         safeDial,
+		TLSHandshakeTimeout: FetchTimeout,
+		DisableKeepAlives:   true,
+	}
 	client := &http.Client{
-		Timeout: FetchTimeout,
-		// Intercept each redirect so we can re-validate the destination —
-		// otherwise a crafted 302 → http://169.254.169.254 bypasses the check
-		// we did at the top (classic SSRF via redirect).
+		Timeout:   FetchTimeout,
+		Transport: transport,
+		// Intercept each redirect so we can re-validate the destination URL
+		// text too — belt-and-suspenders with the per-dial IP check above.
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= MaxRedirects {
 				return errors.New("image: too many redirects")

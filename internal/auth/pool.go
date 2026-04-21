@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"windsurfapi/internal/atomicfile"
 	"windsurfapi/internal/logx"
 	"windsurfapi/internal/models"
 )
@@ -172,19 +173,24 @@ func (p *Pool) Load() error {
 }
 
 // save serialises under lock-held caller. Errors are logged, not returned.
+//
+// The previous implementation used a shared `accounts.json.tmp` path. Two
+// goroutines calling saveLocked concurrently (e.g. the 50-min Firebase
+// loop, the 15-min credits loop, and a dashboard POST all firing within
+// the same millisecond) could interleave bytes into the shared .tmp and
+// the rename would land a corrupt JSON — at which point the next restart
+// would Load() an empty pool and the operator would lose every account.
+// atomicfile.Write generates a unique per-call tmp name to eliminate that
+// race, and pins 0o600 so passwords / tokens never leak to group-readable
+// permissions on shared hosts.
 func (p *Pool) saveLocked() {
 	data, err := json.MarshalIndent(p.accounts, "", "  ")
 	if err != nil {
 		logx.Error("auth save: %s", err.Error())
 		return
 	}
-	tmp := p.file + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		logx.Error("auth save write: %s", err.Error())
-		return
-	}
-	if err := os.Rename(tmp, p.file); err != nil {
-		logx.Error("auth save rename: %s", err.Error())
+	if err := atomicfile.Write(p.file, data); err != nil {
+		logx.Error("auth save: %s", err.Error())
 	}
 }
 
@@ -231,29 +237,79 @@ func (p *Pool) Remove(id string) bool {
 
 // ─── Lookup / mutate ──────────────────────────────────────
 
-// Get returns a snapshot of an account by id, or nil.
+// Get returns a deep snapshot of an account by id, or nil. See cloneAccount
+// for why the copy must be deep.
 func (p *Pool) Get(id string) *Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, a := range p.accounts {
 		if a.ID == id {
-			cp := *a
-			return &cp
+			return cloneAccount(a)
 		}
 	}
 	return nil
 }
 
-// All returns a read-only view of every account.
+// All returns a read-only snapshot of every account.
+//
+// IMPORTANT: this deep-copies the map and slice fields (`Capabilities`,
+// `BlockedModels`, `ModelRateLimits`, `ModelRateStarted`). A shallow `cp := *a`
+// would leave those references aliased with the live pool, so any caller that
+// later iterated e.g. `cp.Capabilities` without holding `p.mu` would race
+// with a writer mutating the same map and hit Go's `fatal error: concurrent
+// map read and map write`, which crashes the whole process — not a
+// recoverable panic. The dashboard's `/dashboard/api/accounts` enumeration
+// triggers this path on every poll, so the race window is real.
 func (p *Pool) All() []*Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	out := make([]*Account, 0, len(p.accounts))
 	for _, a := range p.accounts {
-		cp := *a
-		out = append(out, &cp)
+		out = append(out, cloneAccount(a))
 	}
 	return out
+}
+
+// cloneAccount returns an owned deep copy safe to share across goroutines.
+// Nil inputs return nil to keep callers' `if a := Get(id); a != nil` style
+// working unchanged.
+func cloneAccount(a *Account) *Account {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+	if a.Capabilities != nil {
+		m := make(map[string]Capability, len(a.Capabilities))
+		for k, v := range a.Capabilities {
+			m[k] = v
+		}
+		cp.Capabilities = m
+	}
+	if a.BlockedModels != nil {
+		cp.BlockedModels = append([]string(nil), a.BlockedModels...)
+	}
+	if a.ModelRateLimits != nil {
+		m := make(map[string]int64, len(a.ModelRateLimits))
+		for k, v := range a.ModelRateLimits {
+			m[k] = v
+		}
+		cp.ModelRateLimits = m
+	}
+	if a.ModelRateStarted != nil {
+		m := make(map[string]int64, len(a.ModelRateStarted))
+		for k, v := range a.ModelRateStarted {
+			m[k] = v
+		}
+		cp.ModelRateStarted = m
+	}
+	if a.Credits != nil {
+		c := *a.Credits
+		cp.Credits = &c
+	}
+	if a.rpmHistory != nil {
+		cp.rpmHistory = append([]int64(nil), a.rpmHistory...)
+	}
+	return &cp
 }
 
 // Counts returns {total, active, error}.
@@ -289,8 +345,26 @@ func (p *Pool) IsAuthenticated() bool {
 	return false
 }
 
-// SetStatus updates the status on an account.
+// validStatus restricts what callers (especially the dashboard PATCH route)
+// can write. An unchecked status would let an operator — or an attacker with
+// the dashboard password — freeze an account into an unrecognised state
+// like "hacked", after which `a.Status == StatusActive` checks would
+// silently skip it forever.
+func validStatus(s string) bool {
+	switch s {
+	case StatusActive, StatusError, StatusDisabled, "expired", "invalid":
+		return true
+	}
+	return false
+}
+
+// SetStatus updates the status on an account. Unknown status strings are
+// rejected (returns false) so an accidental typo or crafted PATCH can't
+// wedge an account into a permanent non-active limbo.
 func (p *Pool) SetStatus(id, status string) bool {
+	if !validStatus(status) {
+		return false
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, a := range p.accounts {
