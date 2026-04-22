@@ -44,18 +44,44 @@ func Init() {
 	}
 }
 
-// saveMu serialises disk writes so parallel save() calls land in a
-// deterministic order without holding the main mu across I/O.
-var saveMu sync.Mutex
+// saveMu guards pending save state. The single-writer pattern replaces the
+// earlier "spawn goroutine per call" style so a burst of PUT/POST (e.g. bulk
+// allow/block-list updates from the dashboard) collapses into one disk
+// write of the latest snapshot instead of N queued writes each pinning
+// their own marshalled JSON in the heap.
+var (
+	saveMu      sync.Mutex
+	pendingData []byte
+	pendingWake chan struct{}
+	writerOnce  sync.Once
+)
 
 func save() {
 	data, _ := json.MarshalIndent(cfg, "", "  ")
-	// Disk flush runs async — hot-path `Check()` readers only contend on mu.
-	go func(payload []byte) {
+	saveMu.Lock()
+	pendingData = data
+	writerOnce.Do(func() {
+		pendingWake = make(chan struct{}, 1)
+		go runSaveWriter()
+	})
+	saveMu.Unlock()
+	select {
+	case pendingWake <- struct{}{}:
+	default:
+	}
+}
+
+func runSaveWriter() {
+	for range pendingWake {
 		saveMu.Lock()
-		defer saveMu.Unlock()
-		_ = atomicfile.Write(path, payload)
-	}(data)
+		data := pendingData
+		pendingData = nil
+		saveMu.Unlock()
+		if data == nil {
+			continue
+		}
+		_ = atomicfile.Write(path, data)
+	}
 }
 
 // Get returns a copy of the current config. The list is always non-nil so

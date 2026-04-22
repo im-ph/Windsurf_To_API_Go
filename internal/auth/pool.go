@@ -311,6 +311,37 @@ func cloneAccount(a *Account) *Account {
 	return &cp
 }
 
+// HasEligible reports whether any active, non-blocked, tier-allowed account
+// exists for the given model. Designed for the chat hot path: it avoids the
+// whole-pool deep-copy that `All()` does on every request (30+ accounts ×
+// every request = ~1 MB churn / sec at 100 rps), and returns early on the
+// first match. `tierAllowed` is a closure injected by the caller so this
+// package doesn't need to import `models` (which would pull in scoring /
+// pricing / catalog weight that auth never uses).
+func (p *Pool) HasEligible(modelKey string, tierAllowed func(tier, key string) bool) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, a := range p.accounts {
+		if a.Status != StatusActive {
+			continue
+		}
+		if !tierAllowed(a.Tier, modelKey) {
+			continue
+		}
+		blocked := false
+		for _, b := range a.BlockedModels {
+			if b == modelKey {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			return true
+		}
+	}
+	return false
+}
+
 // Counts returns {total, active, error}.
 type Counts struct {
 	Total  int `json:"total"`

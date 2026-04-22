@@ -40,26 +40,51 @@ func Init() {
 	}
 }
 
-// save serialises the current state + queues the disk write asynchronously.
-// The write itself is behind a dedicated saveMu — this keeps save order
-// deterministic without making the hot-path `mu.Lock` drag disk latency
-// into every `Effective()` / `Get()` call that fires on every chat request.
-var saveMu sync.Mutex
+// save schedules a disk flush. Earlier versions spawned a new goroutine
+// per call, which was OK at low frequency but pathological under a burst —
+// a scripted PUT of 200 per-account proxy entries forked 200 goroutines
+// each holding its own marshalled JSON snapshot (200 × ~20 KB = 4 MB
+// transient heap). We now coalesce: one long-lived writer goroutine, one
+// pending flag; many back-to-back mutations collapse into a single write
+// of the most recent state.
+var (
+	saveMu     sync.Mutex   // guards pendingData / pendingWake
+	pendingData []byte       // nil when no write is queued
+	pendingWake chan struct{} // signals the writer to drain
+	writerOnce sync.Once
+)
 
 func save() {
-	// Marshal happens synchronously (we hold mu, state is quiescent).
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return
 	}
-	// Disk I/O runs async behind its own serialising mu. Chat hot path
-	// readers that only want `Effective()` / `Get()` no longer wait on
-	// disk flush — they only contend for the in-memory state lock.
-	go func(payload []byte) {
+	saveMu.Lock()
+	pendingData = data
+	// Start the writer goroutine exactly once (lazy init — tests that never
+	// hit save() don't leak it).
+	writerOnce.Do(func() {
+		pendingWake = make(chan struct{}, 1)
+		go runSaveWriter()
+	})
+	saveMu.Unlock()
+	select {
+	case pendingWake <- struct{}{}:
+	default: // already signalled — no need to wake again
+	}
+}
+
+func runSaveWriter() {
+	for range pendingWake {
 		saveMu.Lock()
-		defer saveMu.Unlock()
-		_ = atomicfile.Write(path, payload)
-	}(data)
+		data := pendingData
+		pendingData = nil
+		saveMu.Unlock()
+		if data == nil {
+			continue
+		}
+		_ = atomicfile.Write(path, data)
+	}
 }
 
 // Get returns the full proxy snapshot for the dashboard.

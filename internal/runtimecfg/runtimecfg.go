@@ -74,9 +74,15 @@ func Init() {
 	}
 }
 
-// saveMu serialises disk writes so a burst of toggle changes doesn't
-// interleave on the filesystem.
-var saveMu sync.Mutex
+// Single-writer disk flush: a burst of experimental-flag / identity-prompt
+// toggles collapses into one write of the latest state instead of N
+// goroutines each pinning a JSON snapshot.
+var (
+	saveMu      sync.Mutex
+	pendingData []byte
+	pendingWake chan struct{}
+	writerOnce  sync.Once
+)
 
 func persist() {
 	data, err := json.MarshalIndent(state, "", "  ")
@@ -84,14 +90,32 @@ func persist() {
 		logx.Warn("runtime-config: marshal: %s", err.Error())
 		return
 	}
-	// Hot-path `IsEnabled()` readers shouldn't wait on disk; async the write.
-	go func(payload []byte) {
+	saveMu.Lock()
+	pendingData = data
+	writerOnce.Do(func() {
+		pendingWake = make(chan struct{}, 1)
+		go runSaveWriter()
+	})
+	saveMu.Unlock()
+	select {
+	case pendingWake <- struct{}{}:
+	default:
+	}
+}
+
+func runSaveWriter() {
+	for range pendingWake {
 		saveMu.Lock()
-		defer saveMu.Unlock()
-		if err := atomicfile.Write(path, payload); err != nil {
+		data := pendingData
+		pendingData = nil
+		saveMu.Unlock()
+		if data == nil {
+			continue
+		}
+		if err := atomicfile.Write(path, data); err != nil {
 			logx.Warn("runtime-config: write: %s", err.Error())
 		}
-	}(data)
+	}
 }
 
 // ─── Experimental flags ────────────────────────────────────

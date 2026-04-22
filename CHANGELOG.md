@@ -2,6 +2,32 @@
 
 所有有意义的变更都会记录在本文件。版本采用 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.6-go] — 2026-04-22
+
+消化 R3 遗留条目。每一条都是"生产跑得好但审计里挂着"的改进，集中清掉。
+
+### 性能
+
+- **R3-#4 config 持久化改为单写者合并**（[proxycfg](internal/proxycfg/proxycfg.go) / [modelaccess](internal/modelaccess/modelaccess.go) / [runtimecfg](internal/runtimecfg/runtimecfg.go)）—— 之前每次 `save()` 起一个 goroutine，dashboard 批量 PUT（例如一次改 200 条 model-access）会瞬间产生 200 个持有 JSON 快照的 goroutine。改成单个常驻 writer + `pendingData` 合并：多次背靠背写入塌缩为"最近一次完整状态"的单次 `atomicfile.Write`
+- **R3-#12 chat 热路径不再走 `Pool.All()` 深拷贝**（[auth/pool.go](internal/auth/pool.go) `HasEligible` + [server/chat.go](internal/server/chat.go)）—— `/v1/chat/completions` 每次请求先 `All()` 遍历找 eligible 账号，`cloneAccount` 会深拷贝 Capabilities/BlockedModels/ModelRateLimits/ModelRateStarted 四张 map + rpmHistory slice。30+ 账号 × 100 rps = ~1 MB/sec GC 压力仅为一个布尔 check。新 `HasEligible(modelKey, tierAllowedFunc)` 在 RLock 下直接短路，零分配
+
+### 正确性
+
+- **R3-#15 tier 检测正则加词边界**（[auth/ops.go](internal/auth/ops.go)）—— `(?i)pro|teams|...` 会把 `production` / `prolific` / `unpaid` 当成 Pro 账号自动升级。加 `\b...\b`，未来 Windsurf 推新 plan name 需显式扩列表
+- **R3-#17 retry-after 正则要求关键字前缀**（[server/chat.go](internal/server/chat.go)）—— 原 `\b(\d+h)?(\d+m)?(\d+s)?\b` 会把任意日志里的 `5s` 读成 retry-after，把瞬态传输错误误判为限流，触发 5 分钟账号封禁。新正则 `(?i)(?:retry|wait|after|in|for)[-_ :]+((?:\d+h)?(?:\d+m)?(?:\d+s)+)\b` 必须以关键字打头才捕获
+
+### 资源清理
+
+- **R3-#5 `waitPortReady` 失败分支显式关 `stdinKeeper`**（[langserver/pool.go](internal/langserver/pool.go)）—— 原来依赖 `cmd.Wait` goroutine 收尾，如果 `cmd.Process.Kill()` 本身失败（权限 / PID 已回收）pipe 会一直挂着。加 `entry.stdinKeeper.Close()` 作为 belt，重复 close 是安全的
+
+### 遗留（后续再说）
+
+- R3-#6 cache.Set 与 Clear 的 lock ordering（stores 计数可能略偏高，dashboard 遥测层面，非阻塞）
+- R3-#10 `isRateLimitedRW` 的 "caller holds write lock" 约定 - 需要项目内 race detector CI
+- R3-#13 `saveLocked` 错误传播到用户可见路径 - 需要改多个 caller 的 API，成本>收益
+- R3-#16 `modelsCatalog` O(n²) 排序（模型 <80 个，忽略）
+- R2-#8 `logx.emit` 完成了异步写，但 subscribers map 仍在同一 mu 下（较低优先级）
+
 ## [1.3.5-go] — 2026-04-22
 
 安全审计第三轮 + 交付质量改进。R2 之后再跑了一轮纵深审计，修完 7 条 HIGH/MED，外加集中化版本号、前后端品牌清理。

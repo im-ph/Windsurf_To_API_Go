@@ -105,28 +105,11 @@ func (d *Deps) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fast path: does ANY active account hold entitlement for this model?
-	eligible := false
-	for _, a := range d.Pool.All() {
-		if a.Status != auth.StatusActive {
-			continue
-		}
-		if !models.IsTierAllowed(a.Tier, modelKey) {
-			continue
-		}
-		blocked := false
-		for _, b := range a.BlockedModels {
-			if b == modelKey {
-				blocked = true
-				break
-			}
-		}
-		if blocked {
-			continue
-		}
-		eligible = true
-		break
-	}
-	if !eligible {
+	// HasEligible is O(accounts) with no allocations — the previous
+	// implementation walked `d.Pool.All()` which deep-copies every account
+	// (maps + slices) per request, a 30+ account × 100 rps hot loop that
+	// churned ~1 MB/sec of GC pressure on a 1 GB VM for a simple check.
+	if !d.Pool.HasEligible(modelKey, models.IsTierAllowed) {
 		writeJSON(w, http.StatusForbidden, errBody(
 			fmt.Sprintf("模型 %s 在当前账号池中不可用（未订阅或已被封禁）", displayModel),
 			"model_not_entitled"))
@@ -444,7 +427,13 @@ var (
 	//     "5m", "300s", "1h15m"). This is what Codeium actually emits.
 	//   - Loose "retry after 30 seconds" / "wait 5 minutes" prose.
 	//   - Bare "retry_after: 30" integer (seconds).
-	reRetryGoDuration = regexp.MustCompile(`\b(\d+h)?(\d+m)?(\d+s)?\b`)
+	// The Go-duration regex requires the value to follow a rate-limit-ish
+	// keyword ("retry", "wait", "in", "after", "for") — the old pattern
+	// `\b(\d+h)?(\d+m)?(\d+s)?\b` would match ANY "5s" token including
+	// random log lines like "took 5s before ECONNREFUSED", misreading
+	// transient network errors as rate-limit responses and triggering 5-min
+	// account quarantine on healthy accounts.
+	reRetryGoDuration = regexp.MustCompile(`(?i)(?:retry|wait|after|in|for)[-_ :]+((?:\d+h)?(?:\d+m)?(?:\d+s)+)\b`)
 	reRetryProse      = regexp.MustCompile(`(?i)(?:retry\s+after|wait|try\s+again\s+in|please\s+wait|available\s+in)\s+(\d+)\s*(second|minute|hour|s|m|h)\b`)
 	reRetrySecondsKey = regexp.MustCompile(`(?i)retry[-_ ]?after[-_ ]?(?:seconds)?\s*[:=]\s*(\d+)`)
 )
@@ -466,17 +455,14 @@ func parseRetryAfter(msg string) time.Duration {
 	if msg == "" {
 		return 0
 	}
-	// Go-duration — scan across the message and pick the first real match
-	// (the regex itself also matches the empty string, so skip those).
-	for _, m := range reRetryGoDuration.FindAllString(msg, -1) {
-		if m == "" {
+	// Go-duration — the regex now captures the duration in group 1 and
+	// only fires after a keyword (retry/wait/after/in/for), so random "5s"
+	// tokens in transient-error logs can't trigger a false ban anymore.
+	for _, m := range reRetryGoDuration.FindAllStringSubmatch(msg, -1) {
+		if len(m) < 2 || m[1] == "" {
 			continue
 		}
-		// Must contain at least one h/m/s to be a duration, not just "5".
-		if !strings.ContainsAny(m, "hms") {
-			continue
-		}
-		if d, err := time.ParseDuration(m); err == nil && d > 0 {
+		if d, err := time.ParseDuration(m[1]); err == nil && d > 0 {
 			return d
 		}
 	}

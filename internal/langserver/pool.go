@@ -389,6 +389,15 @@ func (p *Pool) Ensure(ctx context.Context, px *Proxy) (*Entry, error) {
 
 	if err := waitPortReady(port, 25*time.Second); err != nil {
 		_ = cmd.Process.Kill()
+		// Close the stdin pipe explicitly. In the happy path this is
+		// handled by the cmd.Wait() goroutine at line 363, but if
+		// cmd.Process.Kill itself fails (process already reaped, PID
+		// recycled, permission error) we can leak the pipe's file
+		// descriptor indefinitely. Safe to close twice — os.File.Close
+		// just returns already-closed error which we ignore.
+		if entry.stdinKeeper != nil {
+			_ = entry.stdinKeeper.Close()
+		}
 		p.mu.Lock()
 		delete(p.entries, key)
 		p.mu.Unlock()

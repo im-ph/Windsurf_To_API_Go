@@ -16,8 +16,12 @@ import (
 	"windsurfapi/internal/models"
 )
 
-var proTierRE = regexp.MustCompile(`(?i)pro|teams|enterprise|trial|individual|premium|paid`)
-var freeTierRE = regexp.MustCompile(`(?i)free`)
+// Tier detection regexes — anchored at word boundaries so "production" /
+// "prolific" / "unpaid" don't accidentally match and promote a free account
+// to Pro. The literal set is kept narrow on purpose; new upstream plan
+// names should be added explicitly rather than widened here.
+var proTierRE = regexp.MustCompile(`(?i)\b(pro|teams|enterprise|trial|individual|premium|paid)\b`)
+var freeTierRE = regexp.MustCompile(`(?i)\bfree\b`)
 
 // AddByToken exchanges an auth token with Codeium and inserts the resulting
 // account. Returns an existing account if the api key is already in the pool.
