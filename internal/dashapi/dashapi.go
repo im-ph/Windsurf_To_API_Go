@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os/exec"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -288,6 +289,23 @@ func (d *Deps) route(w http.ResponseWriter, r *http.Request) {
 	case sub == "/models/catalog" && r.Method == http.MethodGet:
 		d.modelsCatalog(w)
 
+	case sub == "/models/refresh" && r.Method == http.MethodPost:
+		// Manual trigger for the cloud catalog fetch. The periodic loop
+		// runs every 2h; this endpoint lets an operator pull in freshly
+		// announced models on demand after a Windsurf release without
+		// waiting for the next tick. Runs synchronously so the response
+		// carries the new count, but capped at 30s so a dead upstream
+		// can't hang the dashboard request.
+		before := len(models.AllKeys())
+		d.Pool.FetchModelCatalog(proxycfg.Effective)
+		after := len(models.AllKeys())
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"before":  before,
+			"after":   after,
+			"added":   after - before,
+		})
+
 	case sub == "/model-access" && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, modelaccess.Get())
 	case sub == "/model-access" && r.Method == http.MethodPut:
@@ -366,30 +384,30 @@ func (d *Deps) modelsCatalog(w http.ResponseWriter) {
 	}
 	out := make([]group, 0, len(buckets))
 	for name, rows := range buckets {
-		// Sort models by score desc, then by display name.
-		for i := 0; i < len(rows); i++ {
-			for j := i + 1; j < len(rows); j++ {
-				if rows[j].Score > rows[i].Score ||
-					(rows[j].Score == rows[i].Score && rows[j].Display < rows[i].Display) {
-					rows[i], rows[j] = rows[j], rows[i]
-				}
+		// Sort models by score desc, then by display name. sort.Slice is
+		// O(n log n) and zero-alloc; the old O(n²) double-loop cost was
+		// trivial at <80 models but scales cleanly for whatever Windsurf
+		// decides to ship.
+		localRows := rows
+		sort.Slice(localRows, func(i, j int) bool {
+			if localRows[i].Score != localRows[j].Score {
+				return localRows[i].Score > localRows[j].Score
 			}
-		}
+			return localRows[i].Display < localRows[j].Display
+		})
 		top := 0
-		if len(rows) > 0 {
-			top = rows[0].Score
+		if len(localRows) > 0 {
+			top = localRows[0].Score
 		}
-		out = append(out, group{Name: name, Count: len(rows), TopScore: top, Models: rows})
+		out = append(out, group{Name: name, Count: len(localRows), TopScore: top, Models: localRows})
 	}
 	// Groups sorted by top score desc, then by name.
-	for i := 0; i < len(out); i++ {
-		for j := i + 1; j < len(out); j++ {
-			if out[j].TopScore > out[i].TopScore ||
-				(out[j].TopScore == out[i].TopScore && out[j].Name < out[i].Name) {
-				out[i], out[j] = out[j], out[i]
-			}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TopScore != out[j].TopScore {
+			return out[i].TopScore > out[j].TopScore
 		}
-	}
+		return out[i].Name < out[j].Name
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"groups": out})
 }
 

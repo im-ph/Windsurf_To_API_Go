@@ -228,6 +228,12 @@ func (d *Deps) Health(w http.ResponseWriter, r *http.Request) {
 		body["uptime"] = int64(uptimeSeconds())
 		body["accounts"] = d.Pool.Counts()
 		body["ls"] = d.LSP.Snapshot()
+		// Surface "can we still persist accounts.json?" — operators want
+		// to see a transient "disk full" immediately rather than learn
+		// after the next restart that the pool was silently ephemeral.
+		if err := d.Pool.LastSaveError(); err != nil {
+			body["persistError"] = err.Error()
+		}
 	}
 	writeJSON(w, http.StatusOK, body)
 }

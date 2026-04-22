@@ -191,6 +191,16 @@ func Get(k string) (Entry, bool) {
 }
 
 // Set replaces or inserts an entry; evicts oldest when over capacity.
+//
+// Ordering note: the disk write happens BEFORE we take mu, but the index
+// update happens AFTER — before R3-#6 the two were fully separated, which
+// opened a window where a concurrent `Clear()` could RemoveAll the cache
+// dir between our Write and our Lock, leaving the index with a record that
+// claims a file that no longer exists. Next Get would ENOENT+cleanup, so
+// no user-visible corruption, but `stores` / `bytesOnDisk` telemetry
+// drifted. We now verify the backing file still exists under the lock
+// before committing the index update — if Clear ran in between, we abandon
+// this write silently instead of polluting the counters.
 func Set(k string, v Entry) {
 	if v.Text == "" && v.Thinking == "" {
 		return
@@ -200,17 +210,20 @@ func Set(k string, v Entry) {
 		return
 	}
 	path := pathFor(k)
-	// atomicfile.Write generates a unique per-call tmp name + 0o600 so two
-	// concurrent Set(sameKey) calls can't clobber each other's .tmp draft —
-	// the shared `<path>.tmp` collision was the same class of bug round 1
-	// fixed in the auth/proxycfg/modelaccess/runtimecfg/stats persistence
-	// paths; cache Set got missed in that sweep.
 	if err := atomicfile.Write(path, blob); err != nil {
 		return
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
+	// Detect Clear-mid-Set race: Clear() `RemoveAll`s the cache directory
+	// and recreates it. If our file landed before Clear but we're adding
+	// the index entry after Clear reset the counters, reject this write so
+	// we don't leak an index pointer to a missing file (Get would miss +
+	// cleanup anyway, but the telemetry would under-report hits).
+	if _, statErr := os.Stat(path); statErr != nil {
+		return
+	}
 	if el, ok := idx[k]; ok {
 		r := el.Value.(*record)
 		atomic.AddInt64(&bytesOnDisk, int64(len(blob)-r.sizeBytes))

@@ -12,6 +12,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"windsurfapi/internal/atomicfile"
@@ -95,6 +96,12 @@ type Pool struct {
 	mu       sync.RWMutex
 	accounts []*Account
 	file     string
+	// lastSaveErr holds the most recent persist error (or wrapped nil).
+	// Updated atomically by saveLocked so the /health + dashboard overview
+	// can surface "save is broken right now" without needing to refactor
+	// every mutating API to return error — see R3-#13 rationale in the
+	// saveLocked doc comment.
+	lastSaveErr atomic.Value
 }
 
 // New returns an empty pool backed by file (typically "accounts.json").
@@ -182,15 +189,38 @@ func (p *Pool) Load() error {
 // atomicfile.Write generates a unique per-call tmp name to eliminate that
 // race, and pins 0o600 so passwords / tokens never leak to group-readable
 // permissions on shared hosts.
-func (p *Pool) saveLocked() {
+func (p *Pool) saveLocked() error {
 	data, err := json.MarshalIndent(p.accounts, "", "  ")
 	if err != nil {
 		logx.Error("auth save: %s", err.Error())
-		return
+		p.lastSaveErr.Store(errWrap{err})
+		return err
 	}
 	if err := atomicfile.Write(p.file, data); err != nil {
 		logx.Error("auth save: %s", err.Error())
+		p.lastSaveErr.Store(errWrap{err})
+		return err
 	}
+	// Clear the sticky error on success so operators see "recovered" after
+	// a transient disk-full.
+	p.lastSaveErr.Store(errWrap{nil})
+	return nil
+}
+
+// errWrap lets atomic.Value hold a typed nil-or-error without violating
+// atomic.Value's "consistent concrete type" rule.
+type errWrap struct{ err error }
+
+// LastSaveError returns the most recent persist failure (or nil). Exposed
+// for the /health + dashboard overview so an operator can see "yes your
+// AddByKey looked fine but disk is full and state won't survive restart"
+// without trawling the log panel. Zero value is "never saved" = nil.
+func (p *Pool) LastSaveError() error {
+	v := p.lastSaveErr.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(errWrap).err
 }
 
 // ─── Add / remove ─────────────────────────────────────────
@@ -867,8 +897,18 @@ func isRateLimited(a *Account, modelKey string, now int64) bool {
 }
 
 // isRateLimitedRW is the "caller holds Pool.mu.Lock" variant — safe to
-// prune expired entries. Use from Acquire / AcquireByKey where we already
-// hold the write lock.
+// prune expired entries.
+//
+// REQUIRES: caller holds p.mu as WRITER (not RLock). Calling this under a
+// RLock — or without any lock — races with MarkRateLimited / ReportError /
+// saveLocked writers on the same ModelRateLimits map and triggers Go's
+// unrecoverable "concurrent map read and map write" fatal. The only
+// legitimate callers today are Acquire / AcquireByKey, both of which
+// `p.mu.Lock()` up front. Keep it that way.
+//
+// The split from isRateLimited (the RLock-safe read-only version) is the
+// R2-#1 CRITICAL fix — don't merge these back without re-reading that
+// history.
 func isRateLimitedRW(a *Account, modelKey string, now int64) bool {
 	if a.RateLimitedUntil > now {
 		return true

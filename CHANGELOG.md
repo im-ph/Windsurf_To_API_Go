@@ -2,6 +2,25 @@
 
 所有有意义的变更都会记录在本文件。版本采用 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.7-go] — 2026-04-22
+
+清完 1.3.6 遗留段列的全部四条跳过项，同时给模型目录补了手动刷新入口。
+
+### 修复
+
+- **R3-#6 `cache.Set` 与 `Clear` 的 lock ordering**（[cache/cache.go](internal/cache/cache.go)）—— 磁盘写在 mu 外进行，mu 外 Write 成功后取锁时若 `Clear()` 刚刚 `RemoveAll` 了目录，索引会记一个指向不存在文件的 record。加 `os.Stat(path)` 校验在索引更新前确认文件仍在磁盘；Clear 竞争时静默放弃该写入，`stores`/`bytesOnDisk` 计数不再失真
+- **R3-#10 `isRateLimitedRW` 调用约定文档化**（[auth/pool.go](internal/auth/pool.go)）—— 加详细 `REQUIRES` 注释 + R2-#1 CRITICAL 历史交叉引用，阻止未来维护者把两版合并回一个函数触发 `fatal error: concurrent map read and map write`
+- **R3-#13 `saveLocked` 错误可观测**（[auth/pool.go](internal/auth/pool.go) + [server/server.go](internal/server/server.go)）—— 签名加 `error` 返回；新字段 `Pool.lastSaveErr atomic.Value` 持有最近一次持久化错误，成功时自动清零；`/health`（鉴权后）新增 `persistError` 字段让运维在不翻日志的情况下立刻看到"磁盘满导致 AddByKey 没落盘"。未走破坏性的"每个 mutating API 都返回 error" 路线 — API surface 保持稳定
+- **R3-#16 `modelsCatalog` 排序 O(n²) → `sort.Slice`**（[dashapi/dashapi.go](internal/dashapi/dashapi.go)）—— 模型 <80 时性能无感，但规模扩大时自然升级
+
+### 新增
+
+- **手动触发云端模型目录刷新**（[dashapi/dashapi.go](internal/dashapi/dashapi.go)）—— `POST /dashboard/api/models/refresh`，同步调用 `Pool.FetchModelCatalog(proxycfg.Effective)`，返回 `{before, after, added}`。日常的 2 小时定时刷新仍在跑；这个端点让 Windsurf 发新模型当天就能拉下来，不用等下个 tick
+- 每次发布部署自带一次冷启动刷新 —— 1.3.7 上线日志显示：`Model catalog: 86 cloud models, 10 new entries merged`
+
+### 版本
+- `1.3.6-go` → `1.3.7-go`
+
 ## [1.3.6-go] — 2026-04-22
 
 消化 R3 遗留条目。每一条都是"生产跑得好但审计里挂着"的改进，集中清掉。
