@@ -180,18 +180,37 @@ func (p *Pool) RefreshCredits(id string, resolve proxyResolver) CreditRefresh {
 	return CreditRefresh{ID: id, Email: a.Email, OK: true}
 }
 
+// refreshAllInFlight singleflights concurrent RefreshAllCredits — dashboard
+// button-spammers or overlapping periodic ticks share a single in-flight
+// worker set instead of each spawning their own 4-worker pool. Without this,
+// 5 clicks with 30 stuck accounts = 20 goroutines + 5 blocked handlers,
+// each holding its own upstream connection.
+var (
+	refreshAllMu        sync.Mutex
+	refreshAllCached    []CreditRefresh
+	refreshAllCachedAt  time.Time
+)
+
 // RefreshAllCredits walks every active account. Parallelised with a small
 // concurrency limit so one slow / unreachable GetUserStatus (e.g. upstream
 // network glitch, rate-limit on the seat-management endpoint) can't stall
-// the whole 15-min refresh loop — with sequential processing and 30 active
-// accounts each taking up to ~30s to fail, a run could overshoot the
-// interval entirely and back up credits indefinitely.
+// the whole 15-min refresh loop.
 //
-// concurrency=4 is a conservative bound — each refresh hits the same
-// upstream host so too much parallelism would just trigger upstream rate
-// limiting; four in-flight stays well below that ceiling while capping the
-// worst-case sequential wall time at roughly `ceil(N/4) × 30s`.
+// Reentrancy guard: calls that arrive while another RefreshAllCredits is
+// already running return the latest cached result (staleness ≤ 5 s) rather
+// than queueing another refresh storm.
 func (p *Pool) RefreshAllCredits(resolve proxyResolver) []CreditRefresh {
+	// If a refresh finished within the last 5 s AND we're racing a dashboard
+	// spam-click, return the cached view instead of starting a fresh one.
+	// The 15-min periodic loop is sequential so this branch effectively only
+	// affects the dashboard, which is what we want.
+	refreshAllMu.Lock()
+	if time.Since(refreshAllCachedAt) < 5*time.Second && refreshAllCached != nil {
+		cached := refreshAllCached
+		refreshAllMu.Unlock()
+		return cached
+	}
+	refreshAllMu.Unlock()
 	p.mu.RLock()
 	var ids []string
 	for _, a := range p.accounts {
@@ -205,15 +224,23 @@ func (p *Pool) RefreshAllCredits(resolve proxyResolver) []CreditRefresh {
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
 	for i, id := range ids {
-		sem <- struct{}{}
+		// Acquire the slot INSIDE the goroutine so the caller never
+		// blocks on a sem push — otherwise N>workers jobs with dead
+		// upstreams would hang the caller for minutes before the first
+		// worker slot frees.
 		wg.Add(1)
 		go func(i int, id string) {
 			defer wg.Done()
+			sem <- struct{}{}
 			defer func() { <-sem }()
 			out[i] = p.RefreshCredits(id, resolve)
 		}(i, id)
 	}
 	wg.Wait()
+	refreshAllMu.Lock()
+	refreshAllCached = out
+	refreshAllCachedAt = time.Now()
+	refreshAllMu.Unlock()
 	return out
 }
 

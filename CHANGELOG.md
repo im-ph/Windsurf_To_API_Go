@@ -2,6 +2,38 @@
 
 所有有意义的变更都会记录在本文件。版本采用 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.5-go] — 2026-04-22
+
+安全审计第三轮 + 交付质量改进。R2 之后再跑了一轮纵深审计，修完 7 条 HIGH/MED，外加集中化版本号、前后端品牌清理。
+
+### 修复
+
+- **R3-#1 SSE 心跳 goroutine 与 handler 生命周期未同步**（[server/chat.go](internal/server/chat.go)）—— `defer hbCancel()` 只发信号不等 goroutine 真正退出，handler return 时心跳 goroutine 可能还在 `sendRaw(": ping")` 调用 `w.Write`，触发 net/http "superfluous response.WriteHeader" 噪声甚至在 tls 层写已关闭连接。新增 `hbExited chan struct{}` + `defer func(){ hbCancel(); <-hbExited }()`，保证退出同步
+- **R3-#2 `RefreshAllCredits` 阻塞放大**（[auth/ops.go](internal/auth/ops.go)）—— 旧版 `sem <- struct{}{}` 在 goroutine 外阻塞调用方：4 worker 全卡在死上游时 dashboard 按钮点 5 次 = 20 个挂起 goroutine + 5 个阻塞的 handler。改成 (a) sem push 移到 goroutine 内，(b) 5 秒冷却 + cache，并发调用共用最近一次结果，避免 refresh storm
+- **R3-#3 logx 锁内同步磁盘 I/O head-of-line 阻塞**（[logx/logx.go](internal/logx/logx.go)）—— `emit` 在 `mu.Lock` 下调 `appFile.Write`，盘慢时所有 log caller（包括 chat 热路径）串行排队；30 rps × 10 log/req = 300 log/s 时尤其明显。改成 ring + subscribers 在 mu 下，落盘通过 buffered channel (`diskCh` cap 4096) 交给专用 writer goroutine，非阻塞 send，channel 满就丢
+- **R3-#8 `kill_linux` cmdline 子串匹配过宽**（[langserver/kill_linux.go](internal/langserver/kill_linux.go)）—— 旧版 `strings.Contains(cmdline, "language_server")` 会误伤任何 basename 含该子串的进程。改成 exact basename match（`== "language_server_linux_x64"`）
+- **R3-#9 pollCascade 共享瞬态错误计数器**（[client/client.go](internal/client/client.go)）—— 两个 gRPC unary 共用 `transientErrs`，一侧稳定失败 + 另一侧稳定成功会互相消耗预算。拆成 `stepsErrs` / `statusErrs` 独立计数；同时在 retry 分支里刷新 `lastGrowthAt` 避免 3 秒瞬态抖动被 stall 检测误判
+- **R3-#11 `/self-update` 本地分支名校验**（[dashapi/dashapi.go](internal/dashapi/dashapi.go)）—— `git fetch origin -- <branch>` 虽有 `--` 终止符，但 `<branch>` 直接来自 `git rev-parse --abbrev-ref HEAD` 可能是空串 / `HEAD` / 或攻击者可写的 `.git/config` 塞进的怪字符串。新增 `isSafeBranchName` 白名单 `[A-Za-z0-9/_.-]+`（禁止空、`HEAD`、前导 `-`、`..`、长度 >200）
+- **R3-#7 imagex 拒绝 `http://`**（[imagex/imagex.go](internal/imagex/imagex.go)）—— SSRF 已被 `isPrivateIP` 拦截，但纯 HTTP 下的 MITM 可注入任意字节进模型上下文相当于 prompt 投毒。仅保留 `https://` 和 `data:` 两种来源，明确拒绝 `http://` 并给清晰错误
+
+### 版本号 & 品牌
+
+- 新建 [internal/version/version.go](internal/version/version.go) 集中管理 `version.String`。以前 `main.go` / `server.go` / `dashapi.go` 三处各自硬编码 `"1.2.0-go"`，每次发版都有地方漏更
+- 删除所有 `bydwgx1337` 引用（brand 常量 + `/health` provider 字段），发布物统一为 `"WindsurfAPI"`
+- `web/package.json` 与后端对齐（1.3.x 跟随 Go 版本）
+- 模型分组：GPT OSS / O-Series 并入 **OpenAI**，Claude 改名 **Anthropic**，符合品牌真实分类（[models/scoring.go](internal/models/scoring.go)）
+- `DisplayName` 对版本-样式 token 整体大写：`120b → 120B` / `k2.5 → K2.5` / `m2.5 → M2.5` / `1m → 1M`
+
+### 稳定性
+
+- **LS 短暂断连导致对话截断**的根因修复（R3 之前一轮）—— `pollCascade` 对传输层瞬时错误（connection refused / reset / EOF / stream error / i/o timeout 等）最多吞 6 次连续失败，每次 500ms 退避继续同一 `cascade_id`；cascade 在 LS 服务端还活着时能无缝恢复。`ModelError` / ctx cancel / 上游逻辑错原样上传
+
+### 遗留（下轮）
+
+- R3-#4 config 包 save() 无界 goroutine 暴涨（脚本化 PUT 会放大）
+- R3-#5/#6/#10/#12/#13 注释健壮性 / 小边缘 / 性能微调 / 错误传播
+- R3-#15/#16/#17 tier 正则词边界、排序 O(n²)、retry-after 正则过宽
+
 ## [1.3.4-go] — 2026-04-22
 
 安全审计第二轮。第一轮的 13 条修完 + 延后的若干条补上后，再跑了一轮纵深审计，发现 3 条 CRITICAL + 9 条 HIGH/MEDIUM，全部修完。

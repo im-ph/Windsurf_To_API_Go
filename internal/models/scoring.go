@@ -173,9 +173,8 @@ func Score(key string) int {
 // points below the curated flagships so a surprise cloud model doesn't leap
 // ahead of the known top variant.
 var familyBase = map[string]int{
-	"Claude":       82,
-	"GPT":          75,
-	"GPT OSS":      58,
+	"Anthropic":    82,
+	"OpenAI":       75,
 	"Gemini":       72,
 	"DeepSeek":     68,
 	"Grok":         68,
@@ -273,25 +272,25 @@ func inferScore(key string) int {
 	return base
 }
 
-// Family returns the vendor grouping label for a catalog key. OpenAI's GPT
-// and O-series share a single "GPT" group (they're the same vendor and the
-// UI doesn't gain anything from the split). Cloud-merged keys land here as
+// Family returns the vendor grouping label for a catalog key. We group by
+// the model's actual vendor/brand rather than internal sub-series — OpenAI's
+// GPT, GPT-OSS, and O-series all land under one "OpenAI" bucket; Anthropic's
+// Claude variants all under "Anthropic". Cloud-merged keys arrive here as
 // `model-...` literals (e.g. `model-claude-4-5-opus`, `model-gpt-oss-120b`,
-// `model-private-2`) — we match substrings so those land in the right bucket
-// without a second lookup table.
+// `model-private-2`) — substring matching makes those land correctly without
+// a second lookup table.
 func Family(key string) string {
 	k := strings.ToLower(key)
 	switch {
 	case strings.HasPrefix(k, "claude-"), strings.Contains(k, "-claude-"):
-		return "Claude"
-	case strings.HasPrefix(k, "gpt-oss"), strings.Contains(k, "gpt-oss"):
-		return "GPT OSS"
+		return "Anthropic"
 	case strings.HasPrefix(k, "gpt-"),
 		strings.Contains(k, "-gpt-"),
+		strings.Contains(k, "gpt-oss"),
 		strings.HasPrefix(k, "o3"), strings.HasPrefix(k, "o4"),
 		strings.Contains(k, "-o3-"), strings.Contains(k, "-o4-"),
 		strings.Contains(k, "-o3"):
-		return "GPT"
+		return "OpenAI"
 	case strings.HasPrefix(k, "gemini-"), strings.Contains(k, "gemini"):
 		return "Gemini"
 	case strings.HasPrefix(k, "deepseek-"), strings.Contains(k, "deepseek"):
@@ -318,9 +317,9 @@ func Family(key string) string {
 	if info != nil {
 		switch info.Provider {
 		case "anthropic":
-			return "Claude"
+			return "Anthropic"
 		case "openai":
-			return "GPT"
+			return "OpenAI"
 		case "google":
 			return "Gemini"
 		case "deepseek":
@@ -368,9 +367,12 @@ func DisplayName(key string) string {
 			i++
 			continue
 		}
-		// Leave all-numeric / version-style tokens alone ("4.6", "120b").
+		// Version-style tokens keep their digits + dots but upper-case any
+		// size / prefix letters so "120b" renders as "120B", "k2.5" as
+		// "K2.5", "1m" as "1M". The raw catalog keys are all lowercase for
+		// routing purposes; the display layer is where they get branded.
 		if isVersionish(p) {
-			out = append(out, p)
+			out = append(out, strings.ToUpper(p))
 			continue
 		}
 		out = append(out, strings.ToUpper(p[:1])+p[1:])

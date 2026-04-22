@@ -24,12 +24,14 @@ import (
 	"windsurfapi/internal/runtimecfg"
 	"windsurfapi/internal/server"
 	"windsurfapi/internal/stats"
+	"windsurfapi/internal/version"
 )
 
-const (
-	Brand   = "WindsurfAPI bydwgx1337"
-	Version = "1.2.0-go"
-)
+const Brand = "WindsurfAPI"
+
+// Version re-exports the central version string so the banner and any
+// external callers that reach `main.Version` keep working.
+var Version = version.String
 
 func main() {
 	cfg := config.Load()

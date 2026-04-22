@@ -35,6 +35,7 @@ import (
 	"windsurfapi/internal/sysinfo"
 	"windsurfapi/internal/runtimecfg"
 	"windsurfapi/internal/stats"
+	"windsurfapi/internal/version"
 )
 
 // Deps are the pieces only the dashboard cares about.
@@ -440,7 +441,7 @@ func (d *Deps) overview(w http.ResponseWriter) {
 		},
 		// Service version string surfaced by /health — repeated here so the
 		// overview page can render a "version" card without a second round-trip.
-		"version": "1.2.0-go",
+		"version": version.String,
 	})
 }
 
@@ -881,6 +882,23 @@ func (d *Deps) selfUpdate(w http.ResponseWriter, body map[string]any) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
+	// Validate the detected branch before passing it to `git fetch/reset`.
+	// Detached HEAD returns an empty or "HEAD" string from rev-parse; an
+	// attacker who gets write access to `.git/config` could slip in a ref
+	// that `--` would forward as-is. Whitelist the character set to what
+	// git refspecs legitimately contain before we shell it out.
+	rawBranch, _ := before["branch"].(string)
+	branch := strings.TrimSpace(rawBranch)
+	if branch == "" || branch == "HEAD" {
+		branch = "master"
+	}
+	if !isSafeBranchName(branch) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": "本地分支名包含非法字符，拒绝 git 操作：" + branch,
+		})
+		return
+	}
 	dirty, _ := runCmd("git", "status", "--porcelain", "-uno")
 	force, _ := body["forceReset"].(bool)
 	if strings.TrimSpace(dirty) != "" {
@@ -891,10 +909,6 @@ func (d *Deps) selfUpdate(w http.ResponseWriter, body map[string]any) {
 				"dirtyFiles":  dirtyLines(dirty),
 			})
 			return
-		}
-		branch, _ := before["branch"].(string)
-		if branch == "" {
-			branch = "master"
 		}
 		// `--` separator terminates option parsing so a branch literal that
 		// happens to start with "-" (e.g. pushed ref `-upload-pack=...`) is
@@ -908,10 +922,6 @@ func (d *Deps) selfUpdate(w http.ResponseWriter, body map[string]any) {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-	}
-	branch, _ := before["branch"].(string)
-	if branch == "" {
-		branch = "master"
 	}
 	pullOut := "hard-reset applied"
 	if strings.TrimSpace(dirty) == "" {
@@ -1001,6 +1011,34 @@ func runCmd(name string, args ...string) (string, error) {
 // runShell was removed: the last call site (git status --porcelain) was
 // migrated to runCmd so no shell interpolation is ever used. This body is
 // intentionally omitted — do not re-add shell-based helpers.
+
+// isSafeBranchName whitelists the characters a legitimate git branch /
+// ref can contain. We stamp the branch into `git fetch origin -- <branch>`
+// and `git reset --hard -- origin/<branch>`, then `git pull origin -- <branch>`;
+// the `--` separator already blocks option-style injection, but requiring
+// the name to also be `[A-Za-z0-9/_.-]+` closes the (unlikely but cheap)
+// door where a crafted `.git/config` could forward weird characters into
+// git's internal ref parser. Rejects spaces, `..`, leading `-`, and the
+// null byte.
+func isSafeBranchName(s string) bool {
+	if s == "" || s == "HEAD" || len(s) > 200 {
+		return false
+	}
+	if strings.HasPrefix(s, "-") || strings.Contains(s, "..") {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '/' || r == '_' || r == '.' || r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 func dirtyLines(s string) []string {
 	lines := strings.Split(strings.TrimSpace(s), "\n")

@@ -55,8 +55,15 @@ func Resolve(raw string) (*Image, error) {
 	if strings.HasPrefix(s, "data:") {
 		return parseDataURL(s)
 	}
-	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+	if strings.HasPrefix(s, "https://") {
 		return fetchURL(s, MaxRedirects)
+	}
+	if strings.HasPrefix(s, "http://") {
+		// Refuse plain HTTP — SSRF is already blocked by isPrivateIP, but
+		// MITM-injected bytes over cleartext HTTP would be fed straight
+		// into the model context. That's model-input poisoning with a
+		// trivial network attacker. data URLs + https remain fully OK.
+		return nil, errors.New("image: plain http:// URLs are refused, use https:// or a data: URL")
 	}
 	// Bare base64 fallback. MIME is unknowable so we assume PNG — the LS
 	// tolerates a misdeclared MIME as long as the image decodes on their

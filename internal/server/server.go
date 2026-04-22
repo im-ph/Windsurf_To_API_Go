@@ -15,6 +15,7 @@ import (
 	"windsurfapi/internal/dashapi"
 	"windsurfapi/internal/langserver"
 	"windsurfapi/internal/models"
+	"windsurfapi/internal/version"
 	"windsurfapi/internal/web"
 )
 
@@ -219,8 +220,8 @@ func errBody(msg, typ string) map[string]any {
 func (d *Deps) Health(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{
 		"status":   "ok",
-		"provider": "WindsurfAPI bydwgx1337",
-		"version":  "1.2.0-go",
+		"provider": "WindsurfAPI",
+		"version":  version.String,
 	}
 	// Only expose internals when the caller proves they're authorised.
 	if d.Cfg.APIKey == "" || bearerToken(r) == d.Cfg.APIKey {

@@ -70,7 +70,49 @@ var (
 	appFile    *os.File
 	errFile    *os.File
 	streamDate string
+
+	// Async disk writer plumbing. Previously `emit` held `mu` across
+	// `appFile.Write`, which turned every log call into a disk-flush-bound
+	// synchronisation point — SSE-heavy requests sharing the same mu with
+	// 200 log lines/sec had their latency amplified on slow disks. Now
+	// `emit` only populates the ring + notifies subscribers under `mu`,
+	// then best-effort-pushes the entry onto `diskCh`; the writer goroutine
+	// owns `fileMu` and serialises the real I/O independently.
+	fileMu    sync.Mutex
+	diskCh    = make(chan Entry, 4096)
+	diskOnce  sync.Once
 )
+
+// startDiskWriter spins up the single writer goroutine the first time emit
+// is called. Kept in a `sync.Once` so tests that never emit don't leak it
+// and production pays the goroutine cost exactly once.
+func startDiskWriter() {
+	diskOnce.Do(func() {
+		go func() {
+			for e := range diskCh {
+				writeEntryToDisk(e)
+			}
+		}()
+	})
+}
+
+func writeEntryToDisk(e Entry) {
+	fileMu.Lock()
+	defer fileMu.Unlock()
+	rotateIfNeeded()
+	if appFile == nil {
+		return
+	}
+	line, err := json.Marshal(&e)
+	if err != nil {
+		return
+	}
+	line = append(line, '\n')
+	_, _ = appFile.Write(line)
+	if (e.Level == "error" || e.Level == "warn") && errFile != nil {
+		_, _ = errFile.Write(line)
+	}
+}
 
 // SetLogDir is called once at startup by main before emit() ever runs.
 // Rejects paths that contain NUL bytes or `..` traversal markers — the only
@@ -168,19 +210,17 @@ func emit(level Level, msg string, ctx map[string]any) {
 		default: // drop — slow consumer
 		}
 	}
-	// JSONL persistence under the same lock — keeps rotation atomic.
-	rotateIfNeeded()
-	if appFile != nil {
-		line, _ := json.Marshal(&e)
-		line = append(line, '\n')
-		_, _ = appFile.Write(line)
-		if level == LError || level == LWarn {
-			if errFile != nil {
-				_, _ = errFile.Write(line)
-			}
-		}
-	}
 	mu.Unlock()
+
+	// Disk persistence runs async so slow filesystems don't backpressure
+	// into every log caller. Non-blocking send: if diskCh is full (4096
+	// pending lines = ~2-4 MB) we drop to protect liveness rather than
+	// stall the hot path.
+	startDiskWriter()
+	select {
+	case diskCh <- e:
+	default:
+	}
 
 	// Console mirror so pm2/systemd logs keep their usual content.
 	tag := fmt.Sprintf("[%s]", strings.ToUpper(e.Level))

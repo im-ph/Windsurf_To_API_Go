@@ -46,7 +46,9 @@ export function displayModelName(id: string): string {
       continue;
     }
     if (isVersionish(seg)) {
-      out.push(seg);
+      // Upper-case version-style tokens so "120b" → "120B", "k2.5" → "K2.5",
+      // "1m" → "1M" (the raw keys stay lowercase for routing).
+      out.push(seg.toUpperCase());
       continue;
     }
     out.push(seg[0].toUpperCase() + seg.slice(1));

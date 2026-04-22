@@ -5,6 +5,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -288,7 +289,47 @@ const (
 	idleGrace       = 8 * time.Second
 	noGrowthStall   = 25 * time.Second
 	stallRetryMin   = 300
+	// Transient-error budget per poll loop. A single dropped TCP connection
+	// (LS mid-restart, tmpfs hiccup, h2 frame desync) used to kill the whole
+	// conversation here — now we swallow up to pollMaxTransient consecutive
+	// errors, sleep pollRetryDelay between them, and keep polling the same
+	// cascade_id. The LS server-side session is still alive; we just missed
+	// one trajectory snapshot.
+	pollMaxTransient = 6
+	pollRetryDelay   = 500 * time.Millisecond
 )
+
+// isTransientPollErr reports whether err is the kind of gRPC/transport
+// hiccup where the cascade on the LS side is probably still running and
+// worth retrying. Hard modelling errors / context cancellations escape
+// out of the retry wrapper.
+func isTransientPollErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Modelling errors surfaced by windsurf.ParseTrajectorySteps aren't
+	// transient — they come from the LS response body, not the transport.
+	var mErr *ModelError
+	if errors.As(err, &mErr) {
+		return false
+	}
+	s := err.Error()
+	// Substrings we know the underlying h2c transport / kernel surface for
+	// LS restart + socket reset patterns.
+	switch {
+	case strings.Contains(s, "connection refused"),
+		strings.Contains(s, "connection reset"),
+		strings.Contains(s, "broken pipe"),
+		strings.Contains(s, "EOF"),
+		strings.Contains(s, "unexpected EOF"),
+		strings.Contains(s, "i/o timeout"),
+		strings.Contains(s, "use of closed network connection"),
+		strings.Contains(s, "http2: client connection lost"),
+		strings.Contains(s, "stream error"):
+		return true
+	}
+	return false
+}
 
 func (c *Client) pollCascade(ctx context.Context, cascadeID, sessionID string, inputCh int, onChunk func(Chunk)) (*CascadeResult, error) {
 	yielded := map[int]int{}
@@ -308,6 +349,14 @@ func (c *Client) pollCascade(ctx context.Context, cascadeID, sessionID string, i
 	lastStepCount := 0
 	start := time.Now()
 	endReason := "unknown"
+	// Consecutive-transient-error counters per RPC. Keep them separate so
+	// that "steps call reliably succeeds, status call reliably fails" (or
+	// vice-versa) doesn't falsely blow through the budget — each RPC
+	// independently tracks its own recent failure streak and resets on its
+	// own success. Also kept as two independent numbers so you can tell
+	// which leg of the poll is flapping by reading the logs.
+	stepsErrs := 0
+	statusErrs := 0
 
 	emit := func(ch Chunk) {
 		if ch.Text != "" {
@@ -328,10 +377,37 @@ func (c *Client) pollCascade(ctx context.Context, cascadeID, sessionID string, i
 		case <-time.After(pollInterval):
 		}
 
+		// Transient error budget: LS restarts, h2 stream drops, and kernel
+		// EPIPE during LS process flap used to propagate straight up and
+		// truncate the user's conversation mid-answer. We swallow up to
+		// pollMaxTransient of those in a row, sleeping between retries,
+		// then keep walking the same cascade_id — the LS-side session
+		// survives a socket bounce and continues producing trajectory
+		// steps as long as we ask for them.
 		stepsResp, err := c.conn.Unary(ctx, lsService+"/GetCascadeTrajectorySteps", grpcx.Frame(windsurf.BuildGetTrajectoryStepsRequest(cascadeID, 0)), 0)
 		if err != nil {
-			return nil, err
+			if !isTransientPollErr(err) {
+				return nil, err
+			}
+			stepsErrs++
+			if stepsErrs > pollMaxTransient {
+				logx.Warn("Cascade poll steps: gave up after %d transient errors: %s", stepsErrs, err.Error())
+				return nil, err
+			}
+			logx.Debug("Cascade poll steps: transient error #%d (%s) — retrying", stepsErrs, err.Error())
+			// A wave of transient errors means we were probably silent on
+			// the wire for a few seconds. Treat that silence as "activity"
+			// so the stall-detection timer doesn't misread it as the model
+			// having stopped — the cascade on the LS side is still alive.
+			lastGrowthAt = time.Now()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(pollRetryDelay):
+			}
+			continue
 		}
+		stepsErrs = 0
 		steps, err := windsurf.ParseTrajectorySteps(stepsResp)
 		if err != nil {
 			return nil, err
@@ -417,8 +493,29 @@ func (c *Client) pollCascade(ctx context.Context, cascadeID, sessionID string, i
 
 		statusResp, err := c.conn.Unary(ctx, lsService+"/GetCascadeTrajectory", grpcx.Frame(windsurf.BuildGetTrajectoryRequest(cascadeID)), 0)
 		if err != nil {
-			return nil, err
+			// Same transient budget as the steps poll above — the status
+			// RPC races the LS restart window slightly more often because
+			// it fires on every loop iteration unconditionally. Separate
+			// counter from stepsErrs so a one-sided flap doesn't burn both
+			// budgets at once.
+			if !isTransientPollErr(err) {
+				return nil, err
+			}
+			statusErrs++
+			if statusErrs > pollMaxTransient {
+				logx.Warn("Cascade poll status: gave up after %d transient errors: %s", statusErrs, err.Error())
+				return nil, err
+			}
+			logx.Debug("Cascade poll status: transient error #%d (%s) — retrying", statusErrs, err.Error())
+			lastGrowthAt = time.Now()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(pollRetryDelay):
+			}
+			continue
 		}
+		statusErrs = 0
 		status, _ := windsurf.ParseTrajectoryStatus(statusResp)
 		lastStatus = status
 		if status != 1 {

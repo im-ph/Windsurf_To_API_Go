@@ -70,6 +70,11 @@ func killOrphanOnPort(port int) {
 
 // isLSProcess reports whether /proc/<pid>/cmdline names the Windsurf LS
 // binary. cmdline uses NUL separators; we just need the first component.
+// Uses exact basename comparison rather than a substring scan — otherwise
+// unrelated binaries with "language_server" in their name (e.g. somebody's
+// `language_server_py.sh` or `language_server_rs`) listening on the same
+// port would be killed. Explicit basename match narrows the blast radius
+// to the exact upstream binary we actually spawn.
 func isLSProcess(pid string) bool {
 	data, err := os.ReadFile("/proc/" + pid + "/cmdline")
 	if err != nil {
@@ -79,7 +84,19 @@ func isLSProcess(pid string) bool {
 	if i := indexByte(data, 0); i >= 0 {
 		data = data[:i]
 	}
-	return strings.Contains(string(data), "language_server")
+	argv0 := string(data)
+	// Strip trailing args separator if no NUL found (some kernels end with a
+	// lone NUL, already stripped; others don't — belt and braces).
+	if i := strings.Index(argv0, " "); i >= 0 {
+		argv0 = argv0[:i]
+	}
+	// Compare only the basename — the full path on disk might be
+	// /opt/windsurf/... or ./bin/..., we don't care where it lives.
+	base := argv0
+	if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
+		base = base[i+1:]
+	}
+	return base == "language_server_linux_x64"
 }
 
 func indexByte(s []byte, b byte) int {

@@ -620,10 +620,21 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 		wmu.Unlock()
 	}
 
-	// SSE heartbeat — uses the same wmu so ": ping\n\n" never splits a data frame.
+	// SSE heartbeat — uses the same wmu so ": ping\n\n" never splits a data
+	// frame. The handler must wait for this goroutine to actually exit
+	// before returning, otherwise the net/http runtime can reclaim `w` while
+	// the heartbeat is mid-write and log "http: superfluous response…"
+	// noise (and in degenerate cases write to a closed connection). We
+	// couple hbCancel + hbExited so the defer both signals stop AND blocks
+	// until the goroutine has left the select loop.
 	hbCtx, hbCancel := context.WithCancel(r.Context())
-	defer hbCancel()
+	hbExited := make(chan struct{})
+	defer func() {
+		hbCancel()
+		<-hbExited
+	}()
 	go func() {
+		defer close(hbExited)
 		t := time.NewTicker(heartbeatMS)
 		defer t.Stop()
 		for {
@@ -631,10 +642,6 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 			case <-hbCtx.Done():
 				return
 			case <-t.C:
-				// Re-check cancellation after wait — during a ticker fire
-				// and before we grab wmu, the handler may have already
-				// returned and wmu may be a stale ref; hbCtx.Err() closes
-				// the window where we'd write to a destroyed response.
 				if hbCtx.Err() != nil {
 					return
 				}
