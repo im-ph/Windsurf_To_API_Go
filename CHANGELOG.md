@@ -2,6 +2,41 @@
 
 所有有意义的变更都会记录在本文件。版本采用 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.8-go] — 2026-04-22
+
+修复 Claude Code 通过 `/v1/messages` 走反代时"**上下文消失 + 返回空白**"的三个根因。
+
+### 症状定位
+
+Claude Code 设 `ANTHROPIC_BASE_URL=<反代>/v1` 后：
+- **返回空白**：某些请求 assistant 气泡完全空白，无任何 error 提示
+- **上下文消失**：那些失败回合不会进入 Claude Code 的本地对话历史，下一次提问时模型看不到之前的上下文
+
+从线上抓的 SSE 帧上能看到反代把 `200 OK` + `Content-Type: text/event-stream` 发出去了，但事件体要么是 OpenAI 格式（Claude Code 的 Anthropic SDK 解析器不认），要么什么都没发。
+
+### 修复的三个 bug
+
+- **CRIT: `/v1/messages` stream 的 pre-check early-return 写的是 JSON，不是 SSE**（[server/messages.go](internal/server/messages.go) `streamShim`）
+  - `ChatCompletions` 在"model not found / not entitled / no active accounts / body too big / invalid JSON" 这些路径上直接 `writeJSON(w, 400/403/503, ...)` 返回 JSON 错误体。但我们已经给客户端发了 `200 OK` SSE header，然后把 JSON body 塞进 `streamShim.Write`，shim 把它喂给 translator 的 `feed()`，`feed()` 找 `data: ` 前缀一个都没找到，全部丢弃 → 客户端看到一个无事件的合法 SSE 流 → 空白气泡
+  - 新 `streamShim` 捕获 `WriteHeader` 的 status code，非 200 时走 `errBuf`；handler 返回后调 `shim.drain()` 把 JSON error message 解出来，通过 `emitTextDelta("[Error: ...]")` 正式翻译成 Anthropic `message_start + content_block_start + content_block_delta + content_block_stop` 序列。客户端现在显示明确错误文案而非空白
+- **HIGH: `finish()` 在空流上发 `message_delta` 没有前置 `message_start`**（`anthropicTranslator.finish`）
+  - 任何 ChatCompletions 零 chunk 的场景（transient cascade error 全部吞完 → 空响应）都会触发：stream 里第一个事件是 `message_delta`，Anthropic 官方 SDK 的 SSE 状态机要求第一个必须是 `message_start`，直接 reject 整个 stream → 客户端把这条 turn 丢弃，**这就是"上下文消失"的直接原因**（Claude Code 不保存被 reject 的 assistant turn，下次请求的历史里不包含）
+  - `finish()` 开头加一次 `t.startMessage()`（幂等，`t.started` 已是 true 就 no-op）保证前置事件一定存在
+- **MED: 上游的 `: ping` 心跳被翻译器吃掉，Anthropic 客户端长思考时断连**（`anthropicTranslator.feed`）
+  - chat.go 每 15 秒发一个 `: ping\n\n` SSE 注释行保活。translator 的 `feed()` 只认 `data: ` 行，ping 被静默丢弃
+  - 长 thinking 阶段（20-60s 无真实 token 输出）客户端这边完全静默，超过 Anthropic 官方 SDK 的 keepalive 阈值（~30s）后客户端断连，Claude Code 按"上游无响应"处理 → 空白 + turn 丢弃
+  - `feed()` 现在识别 `: ` 开头的注释行，在 `t.started == true` 时转发为 Anthropic 官方的 `event: ping\ndata: {"type":"ping"}\n\n` 保活事件
+
+### 三条合起来的效果
+
+Claude Code 这边看到的行为：
+- 上游返回 JSON 错误 → 以前空白 / 现在显示 `[Error: <真实原因>]`
+- cascade 轮询零 chunk 返回 → 以前空白 + turn 丢失 / 现在显示 `[Error: ...]` 或完整空 assistant turn，turn 保留在历史里
+- 长思考阶段 → 以前 30s 断连 / 现在每 15s 一个 ping，保持连接直到真实内容到
+
+### 版本
+- `1.3.7-go` → `1.3.8-go`
+
 ## [1.3.7-go] — 2026-04-22
 
 清完 1.3.6 遗留段列的全部四条跳过项，同时给模型目录补了手动刷新入口。

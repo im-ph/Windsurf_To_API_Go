@@ -94,6 +94,10 @@ func (d *Deps) Messages(w http.ResponseWriter, r *http.Request) {
 	}
 	shim := &streamShim{tr: tr}
 	d.ChatCompletions(shim, r2)
+	// If ChatCompletions short-circuited with a JSON error, surface the
+	// message text to the Anthropic stream so the client gets an explicit
+	// "[Error: ...]" instead of a blank response.
+	shim.drain()
 	tr.finish()
 }
 
@@ -602,7 +606,21 @@ func (t *anthropicTranslator) feed(raw []byte) {
 		}
 		frame := s[:idx]
 		s = s[idx+2:]
+		sawPing := false
 		for _, line := range strings.Split(frame, "\n") {
+			// Upstream SSE comments (": ping\n\n") are the keepalive
+			// chat.go fires every 15s during long cascades. Bare bytes
+			// don't keep Anthropic clients happy — the official SDK
+			// expects an explicit `event: ping` frame. Forward them
+			// faithfully or the client disconnects on long thinking
+			// phases (30s+ silence → timeout → Claude Code treats the
+			// turn as failed, which surfaces as "blank response" and,
+			// because the client drops the partial assistant turn, the
+			// next request loses context.
+			if strings.HasPrefix(line, ": ") {
+				sawPing = true
+				continue
+			}
 			if !strings.HasPrefix(line, "data: ") {
 				continue
 			}
@@ -617,6 +635,14 @@ func (t *anthropicTranslator) feed(raw []byte) {
 				logx.Warn("Messages SSE parse: %s", err.Error())
 			}
 		}
+		if sawPing {
+			// Keepalive must come AFTER message_start — emit it only
+			// once the stream is "open" to avoid confusing clients that
+			// track state-machine invariants strictly.
+			if t.started {
+				t.send("ping", map[string]any{"type": "ping"})
+			}
+		}
 	}
 	t.pendingSSE.Reset()
 	t.pendingSSE.WriteString(s)
@@ -627,6 +653,16 @@ func (t *anthropicTranslator) finish() {
 		return
 	}
 	t.stopped = true
+	// Anthropic SSE requires message_start as the FIRST event — without it
+	// the official SDK / Claude Code's SSE parser rejects the whole stream
+	// and reports an empty response. Previously, if ChatCompletions
+	// produced zero chunks (early-return on model-blocked / no-accounts /
+	// transient poll failure etc.), processChunk was never called,
+	// startMessage was never fired, and finish() sent message_delta +
+	// message_stop alone — which is exactly the "blank response" symptom
+	// users see on the other machines. The guarded call is a no-op when
+	// a real chunk already triggered it.
+	t.startMessage()
 	t.closeCurrentBlock()
 	cacheRead := 0
 	if v, ok := t.finalU.PromptTokensDetails["cached_tokens"]; ok {
@@ -664,13 +700,26 @@ func (c *responseCapture) Write(b []byte) (int, error) {
 func (c *responseCapture) WriteHeader(status int) { c.status = status }
 
 // streamShim forwards SSE bytes from the chat handler into the translator.
+//
+// IMPORTANT: `ChatCompletions` can short-circuit with a non-200 `writeJSON`
+// response for "model not found" / "not entitled" / "no active accounts" /
+// "body read failed" — none of which are SSE. If we blindly feed those
+// bytes to `tr.feed`, it sees no `data: ` prefix, discards everything,
+// and the client gets a "200 OK" SSE stream that never emits a single
+// event. That's the on-the-wire signature of the "blank response" bug
+// users hit from other Claude Code instances: zero chunks, no
+// message_start, stream closes clean.
+//
+// The shim now captures the upstream status + body and on a non-200 emits
+// a proper Anthropic `message_start` + error-message text block +
+// `message_stop` so the client sees a useful error instead of "".
 type streamShim struct {
-	tr     *anthropicTranslator
-	header http.Header
-	wrote  bool
-	flush  sync.Mutex
-	reader *bufio.Scanner
-	// Buffer small pieces so we can cleanly parse SSE frame boundaries.
+	tr      *anthropicTranslator
+	header  http.Header
+	status  int
+	errBuf  bytes.Buffer // accumulates body when status != 200
+	flush   sync.Mutex
+	reader  *bufio.Scanner
 }
 
 func (s *streamShim) Header() http.Header {
@@ -679,13 +728,39 @@ func (s *streamShim) Header() http.Header {
 	}
 	return s.header
 }
-func (s *streamShim) WriteHeader(status int) { s.wrote = true }
+func (s *streamShim) WriteHeader(status int) { s.status = status }
 func (s *streamShim) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	if s.status != http.StatusOK {
+		// Non-SSE body (JSON error from ChatCompletions' early-return).
+		// Buffer it; surfaced as an Anthropic error message inside
+		// shimDrain() once the handler returns.
+		s.errBuf.Write(b)
+		return len(b), nil
+	}
 	s.tr.feed(b)
 	return len(b), nil
 }
 func (s *streamShim) Flush() {
 	// Pretend we flushed — the translator already forwarded to the real writer.
+}
+
+// drain is called after ChatCompletions returns. If the upstream wrote an
+// error instead of an SSE stream, we surface the message text to the
+// client through a single text block so Claude Code shows the error rather
+// than an empty turn.
+func (s *streamShim) drain() {
+	if s.status == 0 || s.status == http.StatusOK {
+		return
+	}
+	raw := s.errBuf.Bytes()
+	msg := extractErrMsg(raw)
+	if msg == "" {
+		msg = fmt.Sprintf("upstream error (HTTP %d)", s.status)
+	}
+	s.tr.emitTextDelta("[Error: " + msg + "]")
 }
 
 // ─── Error shapes ────────────────────────────────────────
