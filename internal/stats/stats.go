@@ -26,7 +26,15 @@ type ModelCounts struct {
 	InputTokens  int64   `json:"inputTokens"`
 	OutputTokens int64   `json:"outputTokens"`
 	CostUSD      float64 `json:"costUsd"`
-	recent       []int64 `json:"-"`
+	// First / Last request tracking — operators asked for this on the Stats
+	// page so they can see "when did this model first appear" and "what
+	// was the most recent call's latency" at a glance without trawling logs.
+	// Timestamps are unix-ms; durations are in ms.
+	FirstAt int64 `json:"firstAt,omitempty"`
+	FirstMs int64 `json:"firstMs,omitempty"`
+	LastAt  int64 `json:"lastAt,omitempty"`
+	LastMs  int64 `json:"lastMs,omitempty"`
+	recent  []int64 `json:"-"`
 }
 
 type AccountCounts struct {
@@ -89,6 +97,43 @@ func Init() {
 	if state.StartedAt == 0 {
 		state.StartedAt = time.Now().UnixMilli()
 	}
+
+	// One-shot migration: before 1.4.3 we mistakenly recorded AccountCounts
+	// keyed by `acct.APIKey[:8]` instead of `acct.ID`. Those garbled keys
+	// (API-key prefixes like "devin-se", "sk-ws-01", …) clutter the
+	// dashboard account-dimension table because they never match any real
+	// account ID. auth.newID() produces exactly 8 lowercase hex chars; any
+	// key that doesn't fit that shape is legacy garbage and we drop it.
+	// Idempotent — on a clean post-1.4.3 stats.json this loop is a no-op.
+	dropped := 0
+	for k := range state.AccountCounts {
+		if !isHex8(k) {
+			delete(state.AccountCounts, k)
+			dropped++
+		}
+	}
+	if dropped > 0 {
+		// Re-save immediately so the cleanup survives even if the service
+		// is killed before the next Record triggers scheduleSave().
+		if out, err := json.MarshalIndent(&state, "", "  "); err == nil {
+			_ = atomicfile.Write(path, out)
+		}
+	}
+}
+
+func isHex8(s string) bool {
+	if len(s) != 8 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func scheduleSave() {
@@ -149,6 +194,13 @@ func Record(model string, success bool, durationMs int64, accountID string,
 		mc = &ModelCounts{}
 		state.ModelCounts[model] = mc
 	}
+	nowMs := time.Now().UnixMilli()
+	if mc.FirstAt == 0 {
+		mc.FirstAt = nowMs
+		mc.FirstMs = durationMs
+	}
+	mc.LastAt = nowMs
+	mc.LastMs = durationMs
 	mc.Requests++
 	if success {
 		mc.Success++

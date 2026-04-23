@@ -244,6 +244,13 @@ export interface StatsModelCounts {
   avgMs: number;
   p50Ms: number;
   p95Ms: number;
+  // First / last request telemetry — `*At` are unix-ms timestamps; `*Ms`
+  // are that specific call's duration in milliseconds. Zero means "not yet
+  // recorded" (fresh stats or model never used).
+  firstAt?: number;
+  firstMs?: number;
+  lastAt?: number;
+  lastMs?: number;
 }
 
 export interface StatsAccountCounts {

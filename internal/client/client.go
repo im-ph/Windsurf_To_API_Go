@@ -44,9 +44,10 @@ type Chunk struct {
 
 // CascadeOptions carries per-call tunables.
 type CascadeOptions struct {
-	ToolPreamble   string
-	IdentityPrompt string // stamped into the LS system prompt via proto fields 8 + 13
-	ReuseEntry     *ReuseRef
+	ToolPreamble           string
+	IdentityPrompt         string // stamped into the LS system prompt via proto fields 8 + 13
+	ResponseLanguagePrompt string // appended to communication_section, no identity semantics
+	ReuseEntry             *ReuseRef
 
 	// OnChunk is invoked for every delta. Safe to nil for non-streaming calls.
 	OnChunk func(Chunk)
@@ -251,8 +252,9 @@ func (c *Client) CascadeChat(ctx context.Context, msgs []ChatMsg, modelEnum uint
 
 	sendMessage := func() error {
 		proto := windsurf.BuildSendCascadeMessageRequest(c.APIKey, cascadeID, text, modelEnum, modelUID, sessionID, windsurf.SendOpts{
-			ToolPreamble:   opts.ToolPreamble,
-			IdentityPrompt: opts.IdentityPrompt,
+			ToolPreamble:           opts.ToolPreamble,
+			IdentityPrompt:         opts.IdentityPrompt,
+			ResponseLanguagePrompt: opts.ResponseLanguagePrompt,
 		}, latestImages)
 		_, err := c.conn.Unary(ctx, lsService+"/SendUserCascadeMessage", grpcx.Frame(proto), 0)
 		return err

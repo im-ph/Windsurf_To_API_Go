@@ -123,14 +123,121 @@ type Pool struct {
 	// becomes an unmanaged orphan with no StopAll hook. Closing the chan
 	// releases waiters.
 	spawning map[string]chan struct{}
+	// stoppingAll flips to true inside StopAll() so the cmd.Wait exit
+	// watchers know to NOT respawn. Without it, tearing the pool down at
+	// shutdown would race into "LS died unexpectedly → respawn" and leave
+	// a dangling LS process after the Go service exits. Lives under mu.
+	stoppingAll bool
 }
 
-// New creates an empty pool. Call Config to set binary path + API server.
+// New creates an empty pool. Call Config to set binary path + API server,
+// then StartWatchdog() once at boot to enable the periodic health probe.
 func New() *Pool {
 	return &Pool{
 		entries:  map[string]*Entry{},
 		spawning: map[string]chan struct{}{},
 		nextPort: 42101,
+	}
+}
+
+// StartWatchdog spins up a goroutine that periodically probes every pool
+// entry's port. Complements the cmd.Wait exit watcher:
+//
+//   - cmd.Wait only fires when the LS process actually terminates. A
+//     hung-but-alive LS (deadlock, accept queue exhausted, kernel-level
+//     stuck in D state) keeps the process around but stops responding.
+//   - Adopted entries (no Process reference) have no cmd.Wait at all.
+//   - A silent LS exit where cmd.Wait hasn't fired yet (kernel still
+//     reaping the zombie) would leave a window where the port is dead but
+//     our pool still marks it Ready.
+//
+// The watchdog closes all three. Every probeInterval, for each Ready
+// entry we do a lightweight `isPortInUse` loopback check; a port that
+// stays dead across two consecutive probes triggers cleanup (delete
+// entry + convpool invalidate) and schedules an Ensure to respawn. The
+// cmd.Wait watcher's auto-respawn handles the live-process-then-crash
+// path; this handles the "already dead by the time we looked" and
+// "process alive but port unresponsive" cases.
+func (p *Pool) StartWatchdog() {
+	go p.watchdogLoop()
+}
+
+const (
+	probeInterval = 30 * time.Second
+	probeDeadline = 2 // consecutive misses before we declare dead
+)
+
+func (p *Pool) watchdogLoop() {
+	t := time.NewTicker(probeInterval)
+	defer t.Stop()
+	missCount := map[string]int{}
+	for range t.C {
+		p.mu.Lock()
+		if p.stoppingAll {
+			p.mu.Unlock()
+			return
+		}
+		// Snapshot (key, entry) pairs under the lock; probe without it.
+		type ref struct {
+			key   string
+			entry *Entry
+		}
+		snaps := make([]ref, 0, len(p.entries))
+		for k, e := range p.entries {
+			if e.Ready {
+				snaps = append(snaps, ref{k, e})
+			}
+		}
+		p.mu.Unlock()
+
+		// Track which keys we saw this round — missing keys (entry was
+		// removed between snapshots) should have their miss counters
+		// forgotten so a later respawn starts fresh.
+		seen := map[string]bool{}
+		for _, r := range snaps {
+			seen[r.key] = true
+			if isPortInUse(r.entry.Port) {
+				missCount[r.key] = 0
+				continue
+			}
+			missCount[r.key]++
+			if missCount[r.key] < probeDeadline {
+				logx.Debug("LS watchdog: %s port %d miss #%d", r.key, r.entry.Port, missCount[r.key])
+				continue
+			}
+			// Dead. Kill the process (if any) so cmd.Wait fires and the
+			// auto-respawn path takes over. If there's no Process ref
+			// (adopted entry, or hung stale), we need to clean the entry
+			// ourselves and Ensure a replacement.
+			logx.Warn("LS watchdog: %s port %d dead after %d probes — replacing", r.key, r.entry.Port, missCount[r.key])
+			delete(missCount, r.key)
+			if r.entry.Process != nil {
+				_ = r.entry.Process.Kill()
+				// cmd.Wait goroutine will now fire, remove entry, and
+				// respawn. No further action needed here.
+				continue
+			}
+			// Adopted entry — no cmd.Wait. Remove + respawn directly.
+			p.mu.Lock()
+			if p.entries[r.key] == r.entry {
+				delete(p.entries, r.key)
+			}
+			p.mu.Unlock()
+			convpool.InvalidateFor("", r.entry.Port)
+			go func(px *Proxy, key string) {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if _, err := p.Ensure(ctx, px); err != nil {
+					logx.Error("LS watchdog respawn %s failed: %s", key, err.Error())
+				}
+			}(r.entry.Proxy, r.key)
+		}
+		// Garbage-collect miss counters for keys that no longer exist.
+		for k := range missCount {
+			if !seen[k] {
+				delete(missCount, k)
+			}
+		}
 	}
 }
 
@@ -359,24 +466,54 @@ func (p *Pool) Ensure(ctx context.Context, px *Proxy) (*Entry, error) {
 	go pipeLSOutput(key, "stdout", stdoutR)
 	go pipeLSOutput(key, "stderr", stderrR)
 
-	// Watch for exit so we can drop the pool entry + invalidate cascade reuse.
+	// Watch for exit so we can drop the pool entry + invalidate cascade
+	// reuse. If the exit was unexpected (LS crashed rather than being
+	// asked to stop), schedule a respawn so the proxy doesn't silently
+	// sit idle until the next chat request. Previously we relied on lazy
+	// `Ensure` from the hot path to detect and respawn; but after a
+	// startup-time LS crash (e.g. TIME_WAIT race on :42100 after a tight
+	// service restart, or LS's internal manager→worker self-connect
+	// timing out once), nothing would trigger a retry and /health would
+	// keep returning 200 while every chat request failed.
 	go func() {
 		waitErr := cmd.Wait()
-		// Close our end of stdin now that the child is gone. Safe if already
-		// closed during StopAll().
 		_ = stdinW.Close()
-		if waitErr != nil {
-			logx.Warn("LS instance %s exited: %s", key, waitErr.Error())
-		} else {
-			// Clean exit is the expected path after StopAll / systemd stop.
-			// Keep it visible at INFO so the operator can still see the
-			// shutdown trail, but don't cry wolf at WARN.
-			logx.Info("LS instance %s exited cleanly", key)
-		}
 		p.mu.Lock()
-		delete(p.entries, key)
+		stopping := p.stoppingAll
+		// Only drop the entry if it's still the one WE created — a
+		// respawn racing with us would have replaced it already.
+		if cur, ok := p.entries[key]; ok && cur == entry {
+			delete(p.entries, key)
+		}
 		p.mu.Unlock()
 		convpool.InvalidateFor("", entry.Port)
+
+		if stopping {
+			logx.Info("LS instance %s exited cleanly (shutdown)", key)
+			return
+		}
+		if waitErr == nil {
+			// Clean exit without StopAll — rare but benign (e.g. external
+			// `kill <pid>`). Treat like a crash and respawn.
+			logx.Info("LS instance %s exited cleanly unexpectedly — respawning", key)
+		} else {
+			logx.Warn("LS instance %s exited: %s — respawning", key, waitErr.Error())
+		}
+		// Small backoff so a tight-loop crash (misconfigured binary, missing
+		// CAP_NET_BIND, etc.) doesn't fork-bomb the host. Port TIME_WAIT
+		// on the same :42100 is the usual culprit immediately after a
+		// previous exit, and a 2-second wait gives the kernel room to
+		// reap before the next bind.
+		go func(px *Proxy) {
+			time.Sleep(2 * time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if _, err := p.Ensure(ctx, px); err != nil {
+				logx.Error("LS instance %s respawn failed: %s", key, err.Error())
+			} else {
+				logx.Info("LS instance %s respawned", key)
+			}
+		}(entry.Proxy)
 	}()
 
 	// Never log the CSRF token (or any prefix) — it's a per-process secret.
@@ -484,6 +621,13 @@ func (p *Pool) Snapshot() Snapshot {
 // dead port. Waiting here guarantees the next Ensure spawns fresh.
 func (p *Pool) StopAll() {
 	p.mu.Lock()
+	// stoppingAll guards the cmd.Wait exit watcher from firing an auto-
+	// respawn for LSes we're deliberately killing right now. Set under
+	// the same lock that triggers the signals so by the time any victim
+	// actually exits and its watcher takes the lock, the flag is visibly
+	// true. Reset at the end of StopAll so genuine post-StopAll crashes
+	// (dashboard restart path → explicit Ensure → crash) still auto-respawn.
+	p.stoppingAll = true
 	type victim struct {
 		key  string
 		proc *os.Process
@@ -519,6 +663,10 @@ func (p *Pool) StopAll() {
 			}
 		}
 	}
+
+	p.mu.Lock()
+	p.stoppingAll = false
+	p.mu.Unlock()
 }
 
 // isBenignLSNoise is true for LS stderr lines that look like errors or

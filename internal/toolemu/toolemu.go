@@ -401,7 +401,38 @@ func (p *StreamParser) drain() FeedResult {
 	return FeedResult{Text: safe.String(), ToolCalls: done}
 }
 
+// parseToolCallBody decodes the JSON body extracted from between
+// <tool_call>...</tool_call>. LLMs frequently emit two kinds of
+// almost-JSON that strict json.Unmarshal rejects:
+//
+//  1. Literal control chars inside string values — most commonly a real
+//     "\n" in a multi-line Write/Edit `content` parameter, which is how
+//     models naturally spell multi-line code even after being told to
+//     escape. When this hits the strict parser the whole <tool_call>
+//     block silently falls through as literal text, the client never
+//     sees a tool_use event, Claude Code renders "<tool_call>{...}"
+//     as prose, and the user perceives it as "Write/Read/Bash tool
+//     invocation error".
+//
+//  2. Markdown code-fenced JSON (`json fence ... end fence`) — models
+//     default to code fences when they think they're showing JSON.
+//
+// We try strict first (fast path, no allocation), and on failure we
+// strip fences and escape in-string control bytes, then retry strict.
+// If repair also fails, return (_, false) and the caller emits the raw
+// block as text (so it's at least debuggable).
 func parseToolCallBody(body string, counter int) (ToolCall, bool) {
+	if tc, ok := parseToolCallStrict(body, counter); ok {
+		return tc, true
+	}
+	repaired := repairLLMJSON(body)
+	if repaired == body {
+		return ToolCall{}, false
+	}
+	return parseToolCallStrict(repaired, counter)
+}
+
+func parseToolCallStrict(body string, counter int) (ToolCall, bool) {
 	var parsed struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
@@ -409,27 +440,157 @@ func parseToolCallBody(body string, counter int) (ToolCall, bool) {
 	if err := json.Unmarshal([]byte(body), &parsed); err != nil || parsed.Name == "" {
 		return ToolCall{}, false
 	}
-	args := string(parsed.Arguments)
-	if args == "" || args == "null" {
-		args = "{}"
-	} else {
-		// If arguments is a string (escaped JSON), leave as-is; else re-marshal
-		// so downstream sees a clean object literal.
-		var s string
-		if err := json.Unmarshal(parsed.Arguments, &s); err != nil {
-			// not a string — already a JSON value; normalise whitespace
-			if b, err := json.Marshal(json.RawMessage(parsed.Arguments)); err == nil {
-				args = string(b)
-			}
-		} else {
-			args = s
-		}
-	}
+
+	// Normalise arguments → a JSON OBJECT string. Downstream clients
+	// (Claude Code's Anthropic SDK in particular) accumulate the value
+	// verbatim into tool_use.input and call JSON.parse on it when the
+	// block closes. If we pass through anything that isn't a valid JSON
+	// object — a bare string like "Error: …" or "[stuff]" — Claude Code
+	// throws `SyntaxError: Unexpected identifier "Error"` and the whole
+	// assistant turn is dropped.
+	//
+	// Models do occasionally emit bogus shapes like
+	//   {"name":"Read","arguments":"Error: permission denied"}
+	// so treat non-object values as "caller gave us nothing usable" and
+	// fall back to an empty input object. The tool executor on the
+	// client will then report "missing required parameter", which is
+	// ugly but recoverable — worlds better than a hard JSON parse
+	// failure that loses the entire response.
+	args := normalizeToolArguments(parsed.Arguments)
+
 	return ToolCall{
 		ID:            fmt.Sprintf("call_%d_%s", counter, time.Now().Format("150405.000")),
 		Name:          parsed.Name,
 		ArgumentsJSON: args,
 	}, true
+}
+
+// normalizeToolArguments returns a string that is guaranteed to be a valid
+// JSON object literal ("{...}"). Handles the three shapes models actually
+// emit: object (passthrough), string containing escaped JSON (unwrap once),
+// and everything else (degrade to "{}").
+func normalizeToolArguments(raw json.RawMessage) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return "{}"
+	}
+
+	// Case 1: already a JSON object. Re-marshal via RawMessage to
+	// normalise whitespace but preserve exact content.
+	if s[0] == '{' {
+		var obj map[string]any
+		if err := json.Unmarshal(raw, &obj); err == nil {
+			if b, err := json.Marshal(obj); err == nil {
+				return string(b)
+			}
+		}
+		// Malformed object — fall through to fallback.
+		return "{}"
+	}
+
+	// Case 2: a JSON string wrapping the real arguments (OpenAI
+	// occasionally round-trips args this way). Unwrap once and recurse.
+	if s[0] == '"' {
+		var inner string
+		if err := json.Unmarshal(raw, &inner); err == nil {
+			inner = strings.TrimSpace(inner)
+			if inner == "" || inner == "null" {
+				return "{}"
+			}
+			// The unwrapped value must itself be a JSON object — if the
+			// model smuggled prose here, drop it.
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(inner), &obj); err == nil {
+				if b, err := json.Marshal(obj); err == nil {
+					return string(b)
+				}
+			}
+		}
+		return "{}"
+	}
+
+	// Case 3: array, number, bool, etc. — not a tool input shape.
+	return "{}"
+}
+
+// repairLLMJSON makes a best-effort attempt to turn near-JSON emitted by
+// an LLM into valid JSON. Two repairs, in order:
+//
+//   - Strip an outer ```…``` code fence (with or without a language tag).
+//   - Escape literal control bytes (\n \r \t \b \f and other <0x20) that
+//     appear INSIDE string literals. A tiny state machine tracks string /
+//     escape state so structural whitespace outside strings is untouched
+//     and already-escaped sequences (\\n, \\") are left alone.
+//
+// Does NOT fix missing quotes, trailing commas, or unescaped backslashes
+// outside control-char contexts. Those need a real JSON5-style parser and
+// would blow up the binary for marginal benefit; in practice Cascade's
+// tool emissions trip on multi-line strings far more than anything else.
+func repairLLMJSON(s string) string {
+	s = stripCodeFence(strings.TrimSpace(s))
+	return escapeInStringControls(s)
+}
+
+func stripCodeFence(s string) string {
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	// Drop first line (``` or ```json).
+	if nl := strings.IndexByte(s, '\n'); nl != -1 {
+		s = s[nl+1:]
+	} else {
+		return s
+	}
+	s = strings.TrimSpace(s)
+	s = strings.TrimSuffix(s, "```")
+	return strings.TrimSpace(s)
+}
+
+func escapeInStringControls(s string) string {
+	var out strings.Builder
+	out.Grow(len(s) + 8)
+	inString := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !inString {
+			if c == '"' {
+				inString = true
+			}
+			out.WriteByte(c)
+			continue
+		}
+		if escaped {
+			escaped = false
+			out.WriteByte(c)
+			continue
+		}
+		switch c {
+		case '\\':
+			escaped = true
+			out.WriteByte(c)
+		case '"':
+			inString = false
+			out.WriteByte(c)
+		case '\n':
+			out.WriteString(`\n`)
+		case '\r':
+			out.WriteString(`\r`)
+		case '\t':
+			out.WriteString(`\t`)
+		case '\b':
+			out.WriteString(`\b`)
+		case '\f':
+			out.WriteString(`\f`)
+		default:
+			if c < 0x20 {
+				fmt.Fprintf(&out, `\u%04x`, c)
+			} else {
+				out.WriteByte(c)
+			}
+		}
+	}
+	return out.String()
 }
 
 // ParseAll runs a complete (non-streamed) text through the parser in one shot.

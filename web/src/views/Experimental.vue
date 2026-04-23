@@ -162,10 +162,20 @@ onMounted(load);
         >
           <div class="prompt-head">
             <span class="prompt-provider">{{ String(provider) }}</span>
-            <Button size="small" @click="onResetPrompt(String(provider))">
-              <template #icon><RollbackOutlined /></template>
-              恢复默认
-            </Button>
+            <div class="prompt-actions">
+              <Button size="small" @click="onResetPrompt(String(provider))">
+                <template #icon><RollbackOutlined /></template>
+                恢复默认
+              </Button>
+              <Button
+                type="primary"
+                size="small"
+                :loading="savingProvider === String(provider)"
+                @click="onSavePrompt(String(provider))"
+              >
+                保存
+              </Button>
+            </div>
           </div>
           <Textarea
             v-model:value="editing[String(provider)]"
@@ -174,16 +184,6 @@ onMounted(load);
             show-count
             :maxlength="2000"
           />
-          <div class="prompt-actions">
-            <Button
-              type="primary"
-              size="small"
-              :loading="savingProvider === String(provider)"
-              @click="onSavePrompt(String(provider))"
-            >
-              保存
-            </Button>
-          </div>
         </div>
       </div>
     </Card>
@@ -239,8 +239,8 @@ onMounted(load);
   text-transform: capitalize;
 }
 .prompt-actions {
-  margin-top: 10px;
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
 }
 </style>

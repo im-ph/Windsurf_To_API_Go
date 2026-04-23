@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"windsurfapi/internal/auth"
+	"windsurfapi/internal/banhistory"
 	"windsurfapi/internal/cache"
 	"windsurfapi/internal/cloud"
 	"windsurfapi/internal/config"
@@ -213,6 +214,22 @@ func (d *Deps) route(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, stats.Get())
 	case sub == "/stats" && r.Method == http.MethodDelete:
 		stats.Reset()
+		writeJSON(w, http.StatusOK, map[string]any{"success": true})
+
+	case sub == "/bans/history" && r.Method == http.MethodGet:
+		// Bounded history of past rate-limit events. Bans.vue shows this
+		// below the current "live bans" table so operators can see what
+		// was quarantined and for how long, long after the window expired.
+		// n defaults to 200 (ring cap is 500).
+		n := 200
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 && parsed <= 500 {
+				n = parsed
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"entries": banhistory.Recent(n)})
+	case sub == "/bans/history" && r.Method == http.MethodDelete:
+		banhistory.Clear()
 		writeJSON(w, http.StatusOK, map[string]any{"success": true})
 
 	case sub == "/logs" && r.Method == http.MethodGet:

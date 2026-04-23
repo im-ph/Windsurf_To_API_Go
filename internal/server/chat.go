@@ -208,6 +208,8 @@ func (d *Deps) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatID := genChatID()
 	created := time.Now().Unix()
 
+	clientSalt := clientIPSalt(r)
+
 	if body.Stream {
 		d.streamChat(w, r, streamInput{
 			ChatID: chatID, Created: created, DisplayModel: displayModel,
@@ -216,6 +218,7 @@ func (d *Deps) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			EmulateTools: emulateTools, ToolPreamble: toolPreamble,
 			IdentityPrompt: identityPrompt,
 			CacheKey:       ckey,
+			ClientSalt:     clientSalt,
 		})
 		return
 	}
@@ -224,8 +227,34 @@ func (d *Deps) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ModelKey: modelKey, Info: info, Cascade: useCascade,
 		CascadeMsgs: cascadeMsgs, LegacyMsgs: legacyMsgs,
 		EmulateTools: emulateTools, ToolPreamble: toolPreamble,
-		CacheKey: ckey,
+		CacheKey:   ckey,
+		ClientSalt: clientSalt,
 	})
+}
+
+// clientIPSalt extracts a stable per-caller token for the convpool
+// fingerprint. Order: X-Forwarded-For (first value, Caddy/nginx convention)
+// → X-Real-IP → r.RemoteAddr (minus the port). Returns "" only when all
+// three are unset, which shouldn't happen for a real HTTP request but we
+// don't want to panic — "" disables fingerprint partitioning for this
+// request, which is fine for the single-user localhost case.
+func clientIPSalt(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if i := strings.IndexByte(v, ','); i != -1 {
+			return strings.TrimSpace(v[:i])
+		}
+		return strings.TrimSpace(v)
+	}
+	if v := r.Header.Get("X-Real-IP"); v != "" {
+		return strings.TrimSpace(v)
+	}
+	if addr := r.RemoteAddr; addr != "" {
+		if i := strings.LastIndexByte(addr, ':'); i > 0 {
+			return addr[:i]
+		}
+		return addr
+	}
+	return ""
 }
 
 type streamInput struct {
@@ -241,6 +270,11 @@ type streamInput struct {
 	ToolPreamble   string
 	IdentityPrompt string
 	CacheKey       string
+	// ClientSalt partitions the convpool fingerprint so two unrelated
+	// clients that send coincidentally-identical message histories don't
+	// end up reusing each other's cascade_id and bleeding context.
+	// Sourced from X-Forwarded-For → X-Real-IP → RemoteAddr.
+	ClientSalt string
 }
 
 // ─── Non-stream ────────────────────────────────────────────
@@ -257,7 +291,7 @@ func (d *Deps) nonStreamChat(w http.ResponseWriter, r *http.Request, in streamIn
 	reuseEnabled := in.Cascade && !in.EmulateTools && runtimecfg.IsEnabled("cascadeConversationReuse")
 	fpBefore := ""
 	if reuseEnabled {
-		fpBefore = convpool.FingerprintBefore(convMessagesFromClient(in.CascadeMsgs))
+		fpBefore = convpool.FingerprintBefore(convMessagesFromClient(in.CascadeMsgs), in.ClientSalt)
 	}
 	var reuse *convpool.Entry
 	if reuseEnabled && fpBefore != "" {
@@ -353,12 +387,16 @@ func (d *Deps) nonStreamChat(w http.ResponseWriter, r *http.Request, in streamIn
 			inTok = int64(res.Usage.PromptTokens)
 			outTok = int64(res.Usage.CompletionTokens)
 		}
+		// stats key is the account's public ID (matches the 账号管理 UI's
+		// ID column and the RateLimitView response). Passing APIKey here
+		// would leak the key prefix as a "column value" on the dashboard
+		// and also make the column unreadable / unlinkable to the operator.
 		stats.Record(in.DisplayModel, true,
 			time.Since(time.Unix(in.Created, 0)).Milliseconds(),
-			acct.APIKey, inTok, outTok, 200)
+			acct.ID, inTok, outTok, 200)
 
 		if reuseEnabled && res.CascadeID != "" && res.Text != "" {
-			fpAfter := convpool.FingerprintAfter(convMessagesFromClient(in.CascadeMsgs), res.Text)
+			fpAfter := convpool.FingerprintAfter(convMessagesFromClient(in.CascadeMsgs), res.Text, in.ClientSalt)
 			convpool.Checkin(fpAfter, convpool.Entry{
 				CascadeID: res.CascadeID, SessionID: res.SessionID,
 				LSPort: entry.Port, APIKey: acct.APIKey,
@@ -503,6 +541,7 @@ func (d *Deps) runOnce(ctx context.Context, cli *client.Client, in streamInput, 
 	var cascadeOpts client.CascadeOptions
 	cascadeOpts.ToolPreamble = in.ToolPreamble
 	cascadeOpts.IdentityPrompt = in.IdentityPrompt
+	cascadeOpts.ResponseLanguagePrompt = runtimecfg.GetResponseLanguagePrompt()
 	if reuse != nil {
 		cascadeOpts.ReuseEntry = &client.ReuseRef{CascadeID: reuse.CascadeID, SessionID: reuse.SessionID}
 	}
@@ -658,7 +697,7 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 	hadSuccess := false
 	collected := []toolemu.ToolCall{}
 	var accText, accThink strings.Builder
-	var curAPIKey string
+	var curAccountID string
 
 	var pathT sanitize.Stream
 	var pathK sanitize.Stream
@@ -679,13 +718,20 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 		send(chunkThinking(in, s))
 	}
 	emitTool := func(tc toolemu.ToolCall, idx int) {
+		// Tool arguments are part of a protocol contract with the caller's
+		// tool executor, not prose to the user. Running them through
+		// sanitize.Text turns absolute workspace paths into relative "./…"
+		// which downstream validators (Claude Code's Read/Write schema,
+		// which requires an absolute file_path) reject with "The model
+		// produced an invalid tool call". Pass through untouched.
+		logx.Debug("emit tool_call: name=%s id=%s args=%.200s", tc.Name, tc.ID, tc.ArgumentsJSON)
 		send(map[string]any{
 			"id": in.ChatID, "object": "chat.completion.chunk", "created": in.Created, "model": in.DisplayModel,
 			"choices": []map[string]any{{
 				"index": 0,
 				"delta": map[string]any{"tool_calls": []map[string]any{{
 					"index": idx, "id": tc.ID, "type": "function",
-					"function": map[string]any{"name": tc.Name, "arguments": sanitize.Text(tc.ArgumentsJSON)},
+					"function": map[string]any{"name": tc.Name, "arguments": tc.ArgumentsJSON},
 				}}},
 				"finish_reason": nil,
 			}},
@@ -723,7 +769,7 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 	reuseEnabled := in.Cascade && !in.EmulateTools && runtimecfg.IsEnabled("cascadeConversationReuse")
 	var reuse *convpool.Entry
 	if reuseEnabled {
-		fp := convpool.FingerprintBefore(convMessagesFromClient(in.CascadeMsgs))
+		fp := convpool.FingerprintBefore(convMessagesFromClient(in.CascadeMsgs), in.ClientSalt)
 		if fp != "" {
 			reuse = convpool.Checkout(fp)
 		}
@@ -750,7 +796,7 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 			}
 		}
 		tried = append(tried, acct.APIKey)
-		curAPIKey = acct.APIKey
+		curAccountID = acct.ID
 
 		px := proxycfg.Effective(acct.ID)
 
@@ -780,9 +826,10 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 		var cascadeResult *client.CascadeResult
 		if in.Cascade {
 			opts := client.CascadeOptions{
-				ToolPreamble:   in.ToolPreamble,
-				IdentityPrompt: in.IdentityPrompt,
-				OnChunk:        onChunk,
+				ToolPreamble:           in.ToolPreamble,
+				IdentityPrompt:         in.IdentityPrompt,
+				ResponseLanguagePrompt: runtimecfg.GetResponseLanguagePrompt(),
+				OnChunk:                onChunk,
 			}
 			if reuse != nil {
 				opts.ReuseEntry = &client.ReuseRef{CascadeID: reuse.CascadeID, SessionID: reuse.SessionID}
@@ -858,7 +905,7 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 			outTok = int64(usage.CompletionTokens)
 		}
 		stats.Record(in.DisplayModel, true, time.Since(start).Milliseconds(),
-			acct.APIKey, inTok, outTok, 200)
+			acct.ID, inTok, outTok, 200)
 		send(chunkFinish(in, finish, usage))
 		// include_usage-style terminal chunk
 		send(map[string]any{
@@ -877,7 +924,7 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 	// we can't extract an upstream status — record with 0 to land in the
 	// "transport / unknown" bucket on the dashboard.
 	stats.Record(in.DisplayModel, false, time.Since(start).Milliseconds(),
-		curAPIKey, 0, 0, 0)
+		curAccountID, 0, 0, 0)
 	if !rolePrinted {
 		send(chunkRole(in))
 	}
@@ -969,11 +1016,12 @@ func nonStreamBody(in streamInput, text, thinking string, toolCalls []toolemu.To
 		message["content"] = nil
 		tcs := make([]map[string]any, 0, len(toolCalls))
 		for _, tc := range toolCalls {
+			// Do not sanitize tool arguments — see emitTool comment.
 			tcs = append(tcs, map[string]any{
 				"id": tc.ID, "type": "function",
 				"function": map[string]any{
 					"name":      tc.Name,
-					"arguments": sanitize.Text(tc.ArgumentsJSON),
+					"arguments": tc.ArgumentsJSON,
 				},
 			})
 		}

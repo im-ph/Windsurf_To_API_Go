@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"windsurfapi/internal/atomicfile"
+	"windsurfapi/internal/banhistory"
 	"windsurfapi/internal/logx"
 	"windsurfapi/internal/models"
 )
@@ -699,6 +700,21 @@ func (p *Pool) MarkRateLimited(apiKey string, d time.Duration, modelKey string) 
 			logx.Warn("Account %s (%s) rate-limited (all models): server=%s → effective=%s",
 				a.ID, a.Email, d, effective)
 		}
+		// Append to the bounded history ring so the dashboard's "历史记录"
+		// panel can show what was banned when, long after the window has
+		// expired and the row has dropped out of the live Bans view.
+		// Record inside the pool lock so the snapshot's Email/AccountID
+		// is consistent with what we just mutated — Record itself takes
+		// its own RLock, different mutex, no deadlock.
+		banhistory.Record(banhistory.Entry{
+			Ts:        start,
+			AccountID: a.ID,
+			Email:     a.Email,
+			Model:     modelKey,
+			Server:    d.Milliseconds(),
+			Effective: effective.Milliseconds(),
+			Until:     until,
+		})
 		p.saveLocked()
 		return
 	}

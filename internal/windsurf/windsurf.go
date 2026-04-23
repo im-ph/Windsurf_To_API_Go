@@ -238,6 +238,12 @@ type SendOpts struct {
 	// into the communication_section override (field 13) to maximise the
 	// chance of beating Cascade's baked-in "I am Cascade" identity.
 	IdentityPrompt string
+
+	// ResponseLanguagePrompt: appended to communication_section so the
+	// model defaults to a target language (typically Simplified Chinese)
+	// regardless of what language the stacked system prompts were written
+	// in. Empty string = no steer.
+	ResponseLanguagePrompt string
 }
 
 // ImageData mirrors exa.cortex_pb.ImageData on the wire —
@@ -331,10 +337,12 @@ func buildCascadeConfig(modelEnum uint64, modelUID string, opts SendOpts, hasIma
 		// — those trigger Claude Code / Cursor / OpenCode prompt-injection
 		// detectors and caused assistant turns to be silently rejected
 		// client-side. Access-pattern context still communicated.
-		comm := sectionOverride(
-			"You are an AI assistant accessed via API, not running inside an IDE. " +
-				"Use the tool-calling capabilities described above when appropriate.")
-		conv = pbenc.AppendMessageField(conv, 13, comm)
+		commBody := "You are an AI assistant accessed via API, not running inside an IDE. " +
+			"Use the tool-calling capabilities described above when appropriate."
+		if opts.ResponseLanguagePrompt != "" {
+			commBody += " " + opts.ResponseLanguagePrompt
+		}
+		conv = pbenc.AppendMessageField(conv, 13, sectionOverride(commBody))
 	} else {
 		conv = pbenc.AppendMessageField(conv, 10, sectionOverride("No tools are available."))
 		conv = pbenc.AppendMessageField(conv, 12, sectionOverride(
@@ -351,6 +359,9 @@ func buildCascadeConfig(modelEnum uint64, modelUID string, opts SendOpts, hasIma
 			"respond using your training knowledge."
 		if opts.IdentityPrompt != "" {
 			commBody = opts.IdentityPrompt + "\n\n" + commBody
+		}
+		if opts.ResponseLanguagePrompt != "" {
+			commBody += " " + opts.ResponseLanguagePrompt
 		}
 		conv = pbenc.AppendMessageField(conv, 13, sectionOverride(commBody))
 	}

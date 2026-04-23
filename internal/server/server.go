@@ -47,10 +47,19 @@ func Handler(d *Deps) http.Handler {
 	mux.Handle("/auth/accounts/", d.authMiddleware(http.HandlerFunc(d.AuthAccounts)))
 	mux.Handle("/auth/login", d.authMiddleware(http.HandlerFunc(d.AuthLogin)))
 
-	mux.Handle("/v1/models", d.authMiddleware(http.HandlerFunc(d.ModelsList)))
-	mux.Handle("/v1/chat/completions", d.authMiddleware(http.HandlerFunc(d.ChatCompletions)))
-	mux.Handle("/v1/messages", d.authMiddleware(http.HandlerFunc(d.Messages)))
-	mux.Handle("/v1/responses", d.authMiddleware(http.HandlerFunc(d.Responses)))
+	// All /v1/* endpoints wrap the chain `noCompress → authMiddleware → handler`.
+	// noCompress strips inbound `Accept-Encoding` (so nothing downstream tries
+	// to gzip/br our response — streaming SSE through a compressing proxy
+	// buffers until the compression block fills, producing seconds-long
+	// perceived latency) and pins outbound `Content-Encoding: identity` +
+	// `X-Accel-Buffering: no` + `Cache-Control: no-cache, no-transform` so
+	// Caddy / nginx / Cloudflare don't re-transform the stream. Non-stream
+	// JSON responses get the same treatment — marginal perf loss, but
+	// uniform behaviour beats "SSE works but non-stream sometimes hitches".
+	mux.Handle("/v1/models", noCompress(d.authMiddleware(http.HandlerFunc(d.ModelsList))))
+	mux.Handle("/v1/chat/completions", noCompress(d.authMiddleware(http.HandlerFunc(d.ChatCompletions))))
+	mux.Handle("/v1/messages", noCompress(d.authMiddleware(http.HandlerFunc(d.Messages))))
+	mux.Handle("/v1/responses", noCompress(d.authMiddleware(http.HandlerFunc(d.Responses))))
 
 	// Dashboard SPA + API.
 	mux.HandleFunc("/dashboard", servePanel)
@@ -177,6 +186,41 @@ func bearerToken(r *http.Request) string {
 		return k
 	}
 	return h
+}
+
+// noCompress pins the response to identity encoding and tells downstream
+// proxies (Caddy / nginx / Cloudflare / any ELB in front) to never buffer
+// or re-transform the body. Applied to every /v1/* route because:
+//
+//   1. Streaming SSE through a gzip-ing intermediary buffers until the
+//      compression block fills — a 30-second "silent" period before the
+//      client sees any token, even though we're emitting chunks fine.
+//   2. Non-stream JSON responses get the same treatment for uniformity —
+//      the marginal bandwidth cost is trivial (responses are small), and
+//      it means operators don't have one class of request that goes through
+//      a compressor while another doesn't, with different latency profiles.
+//
+// Headers we set:
+//   - `Content-Encoding: identity` — forbids any transformer from compressing
+//   - `Cache-Control: no-cache, no-transform` — `no-transform` is the RFC
+//     knob that forbids MITM compressors / minifiers (not all proxies honour
+//     it, hence the identity pin above; belt + braces)
+//   - `X-Accel-Buffering: no` — nginx / Caddy-with-ngx-compat convention to
+//     disable proxy_buffering per-response
+//
+// Request side:
+//   - Strip `Accept-Encoding` — otherwise Go's net/http default transport
+//     chain could (in some future change) auto-negotiate compression for
+//     a response that intermediate code paths assume is identity.
+func noCompress(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Del("Accept-Encoding")
+		h := w.Header()
+		h.Set("Content-Encoding", "identity")
+		h.Set("Cache-Control", "no-cache, no-transform")
+		h.Set("X-Accel-Buffering", "no")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (d *Deps) authMiddleware(next http.Handler) http.Handler {

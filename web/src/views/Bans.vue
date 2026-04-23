@@ -1,16 +1,28 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { Button, Card, Table, Tag, Popconfirm, message } from 'ant-design-vue';
-import { ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons-vue';
+import { ReloadOutlined, ThunderboltOutlined, DeleteOutlined } from '@ant-design/icons-vue';
 import PageHeader from '@/components/PageHeader.vue';
 import MetricCard from '@/components/MetricCard.vue';
 import { listAccounts, patchAccount } from '@/api/accounts';
 import type { AccountRow } from '@/api/types';
-import { toast } from '@/api/request';
+import { toast, http } from '@/api/request';
 import { displayModelName } from '@/utils/modelName';
+
+interface BanHistoryEntry {
+  ts: number;
+  accountId: string;
+  email: string;
+  model?: string;
+  serverMs: number;
+  effectiveMs: number;
+  until: number;
+}
 
 const accounts = ref<AccountRow[]>([]);
 const loading = ref(false);
+const history = ref<BanHistoryEntry[]>([]);
+const historyLoading = ref(false);
 const tick = ref(0);
 let tickTimer: number | null = null;
 
@@ -26,14 +38,40 @@ async function load(): Promise<void> {
   }
 }
 
+async function loadHistory(): Promise<void> {
+  historyLoading.value = true;
+  try {
+    const r = await http.get<{ entries: BanHistoryEntry[] }>('/bans/history?limit=200');
+    history.value = r.entries ?? [];
+  } catch (err) {
+    toast(err, '加载历史失败');
+  } finally {
+    historyLoading.value = false;
+  }
+}
+
+async function clearHistory(): Promise<void> {
+  try {
+    await http.delete('/bans/history');
+    history.value = [];
+    message.success('已清空历史');
+  } catch (err) {
+    toast(err, '清空失败');
+  }
+}
+
 // 1-second tick drives the countdown text; 10-second refetch lets the
 // server's automatic lift (when the rate-limit window expires inside
 // Acquire) reach this view without the user hitting 刷新 themselves.
 onMounted(() => {
   load();
+  loadHistory();
   tickTimer = window.setInterval(() => {
     tick.value++;
-    if (tick.value % 10 === 0 && !document.hidden) load();
+    if (tick.value % 10 === 0 && !document.hidden) {
+      load();
+      loadHistory();
+    }
   }, 1000);
 });
 onUnmounted(() => {
@@ -212,6 +250,39 @@ const columns = [
   { title: '最近探测', dataIndex: 'lastProbed', width: 170 },
   { title: '操作', dataIndex: 'actions', width: 380 },
 ];
+
+const historyColumns = [
+  { title: '发生时间', dataIndex: 'ts', width: 170 },
+  { title: '账号', dataIndex: 'email', ellipsis: true },
+  { title: '范围', dataIndex: 'scope', width: 200 },
+  { title: '上游时长', dataIndex: 'serverMs', width: 110 },
+  { title: '生效时长', dataIndex: 'effectiveMs', width: 110 },
+  { title: '解除时间', dataIndex: 'until', width: 170 },
+  { title: '当前状态', dataIndex: 'active', width: 100 },
+];
+
+const historyRows = computed(() => {
+  const now = Date.now();
+  // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+  void tick.value; // keep "active" badge live
+  return history.value.map((e) => ({
+    ...e,
+    active: e.until > now,
+  }));
+});
+
+function fmtDuration(ms: number): string {
+  if (!ms || ms <= 0) return '—';
+  if (ms < 60_000) return `${Math.round(ms / 1000)} s`;
+  const mins = Math.floor(ms / 60_000);
+  const secs = Math.round((ms % 60_000) / 1000);
+  if (mins >= 60) {
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return `${h}h${m.toString().padStart(2, '0')}m`;
+  }
+  return `${mins}m${secs.toString().padStart(2, '0')}s`;
+}
 </script>
 
 <template>
@@ -315,6 +386,59 @@ const columns = [
       </template>
     </Table>
   </Card>
+
+  <Card size="small" style="margin-top: 16px" :body-style="{ padding: 0 }">
+    <template #title>
+      历史记录
+      <span class="count-hint">
+        最近 {{ history.length }} 条限速/限流事件 · 最多保留 500 条
+      </span>
+    </template>
+    <template #extra>
+      <Popconfirm title="确认清空历史记录？" @confirm="clearHistory">
+        <Button size="small" danger :disabled="history.length === 0">
+          <template #icon><DeleteOutlined /></template>
+          清空
+        </Button>
+      </Popconfirm>
+    </template>
+    <Table
+      :data-source="historyRows"
+      :columns="historyColumns"
+      :loading="historyLoading"
+      :pagination="{ pageSize: 20, showSizeChanger: false }"
+      row-key="ts"
+      size="middle"
+    >
+      <template #bodyCell="{ column, record }">
+        <template v-if="column.dataIndex === 'ts'">
+          <span class="text-mono">{{ fmtBeijing(record.ts) }}</span>
+        </template>
+        <template v-else-if="column.dataIndex === 'email'">
+          <span>{{ record.email || '—' }}</span>
+        </template>
+        <template v-else-if="column.dataIndex === 'scope'">
+          <Tag v-if="!record.model" color="red">全账号</Tag>
+          <code v-else class="scope-model">{{ displayModelName(record.model) }}</code>
+        </template>
+        <template v-else-if="column.dataIndex === 'serverMs'">
+          <span class="text-mono">{{ fmtDuration(record.serverMs) }}</span>
+        </template>
+        <template v-else-if="column.dataIndex === 'effectiveMs'">
+          <span class="text-mono">{{ fmtDuration(record.effectiveMs) }}</span>
+        </template>
+        <template v-else-if="column.dataIndex === 'until'">
+          <span class="text-mono">{{ fmtBeijing(record.until) }}</span>
+        </template>
+        <template v-else-if="column.dataIndex === 'active'">
+          <Tag v-if="record.active" color="warning">
+            <ThunderboltOutlined /> 进行中
+          </Tag>
+          <Tag v-else color="default">已解除</Tag>
+        </template>
+      </template>
+    </Table>
+  </Card>
 </template>
 
 <style scoped>
@@ -388,5 +512,15 @@ const columns = [
   color: var(--color-text-dim);
   font-size: 11px;
   margin-top: 4px;
+}
+
+.scope-model {
+  font-family: var(--font-mono);
+  background: var(--color-surface-alt);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--color-warning);
+  font-weight: 600;
 }
 </style>

@@ -95,7 +95,15 @@ func sha256Hex(in string) string {
 
 // FingerprintBefore returns the hash for "resume this conversation", based on
 // every message except the latest user turn. Nil when nothing to resume.
-func FingerprintBefore(msgs []Message) string {
+//
+// clientSalt partitions the fingerprint by caller so two independent
+// clients that happen to send an identical message history (common when
+// Claude Code's fixed system prompt + CLAUDE.md template collides across
+// new sessions) don't end up sharing the same cascade_id and bleeding
+// context into each other. Pass the client IP (or any per-caller token)
+// — an empty salt disables partitioning, which is ONLY safe for
+// single-user deployments.
+func FingerprintBefore(msgs []Message, clientSalt string) string {
 	if len(msgs) < 2 {
 		return ""
 	}
@@ -111,15 +119,16 @@ func FingerprintBefore(msgs []Message) string {
 		return ""
 	}
 	b, _ := json.Marshal(canonicalise(hist))
-	return sha256Hex(string(b))
+	return sha256Hex(clientSalt + "\x00" + string(b))
 }
 
 // FingerprintAfter is what the NEXT request's FingerprintBefore will look up.
-func FingerprintAfter(msgs []Message, assistantText string) string {
+// clientSalt must match what FingerprintBefore will receive on the next turn.
+func FingerprintAfter(msgs []Message, assistantText, clientSalt string) string {
 	full := append([]Message{}, msgs...)
 	full = append(full, Message{Role: "assistant", Content: assistantText})
 	b, _ := json.Marshal(canonicalise(full))
-	return sha256Hex(string(b))
+	return sha256Hex(clientSalt + "\x00" + string(b))
 }
 
 // Checkout removes and returns the matching entry, or nil on miss / expired.
