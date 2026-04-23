@@ -132,6 +132,7 @@ type openAIRequest struct {
 	MaxTokens   int                 `json:"max_tokens,omitempty"`
 	Messages    []toolemu.OAIMessage `json:"messages"`
 	Tools       []toolemu.Tool      `json:"tools,omitempty"`
+	ToolChoice  json.RawMessage     `json:"tool_choice,omitempty"`
 	Temperature *float64            `json:"temperature,omitempty"`
 	TopP        *float64            `json:"top_p,omitempty"`
 	Stop        []string            `json:"stop,omitempty"`

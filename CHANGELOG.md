@@ -2,6 +2,42 @@
 
 所有有意义的变更都会记录在本文件。版本采用 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.4.0-go] — 2026-04-22
+
+新增 OpenAI Responses API（`/v1/responses`）兼容层 —— 现在反代同时支持三种客户端协议：
+
+| 端点 | 适用客户端 |
+|---|---|
+| `/v1/chat/completions` | OpenAI Chat API 系（绝大多数 SDK、Cursor、LibreChat、…） |
+| `/v1/messages` | Anthropic API 系（Claude Code 官方、Anthropic SDK、Aider 等） |
+| `/v1/responses` | **新**：OpenAI Responses API 系（2025 年后推出的 Codex、Agents SDK、Claude Code 的 OpenAI backend、新版 LangChain 的 OpenAIResponses 等） |
+
+### 新端点能力
+
+- **请求**：`input` 字段同时接受 `"hi"` bare string / `[{role, content:[{type:"input_text", text}]}]` 消息数组 / `[{type:"function_call"/"function_call_output"}]` 工具历史
+- **`instructions` 字段** 映射为首条 system message
+- **`max_output_tokens`** 映射为 `max_tokens`；`tools`/`tool_choice`/`temperature`/`top_p` 直通
+- **响应**：`output[]` 数组含 `message` / `reasoning` / `function_call` item types；`usage.input_tokens` / `output_tokens` / `total_tokens`
+- **流式**：完整 Responses API SSE 事件机：`response.created` → `response.in_progress` → `response.output_item.added` → `response.content_part.added` → `response.output_text.delta` ×N → `response.output_text.done` → `response.content_part.done` → `response.output_item.done` → `response.completed`，每条事件带 `sequence_number` 供客户端排序
+- **tool calls**：流式下会正确发 `response.function_call_arguments.delta` / `...done`，一条 message item 后可跟多条 function_call items
+- **ping 保活**：复用底层 chat.go 的 15s 心跳，翻译成 `response.ping` 事件防止长思考超时
+- **错误透传**：上游 pre-check 失败（非 200）时 shim 通过 `emitTextDelta("[Error: ...]")` 吐进 Responses 流，绝不再出现"空白 turn"
+
+### 共享现有基础设施
+
+Responses 端点经 `responsesToChatRequest` 翻译后走同一条 `ChatCompletions`：账号池、pollCascade 瞬态恢复、`HasEligible` 零分配快检、tool emulation、cache、stats、sanitize、identity prompt、cascade 复用池 —— **所有现有可靠性/性能特性一次到位**
+
+### 未覆盖（明确记录）
+
+- `reasoning: {effort:"..."}` 暂不路由（Cascade backend 不暴露推理努力度开关）
+- `response_format` / `json_schema` 暂忽略（Cascade 不支持严格 schema）
+- `previous_response_id` 多轮连续不支持（无服务端记忆；客户端请把历史放进 `input`）
+- `tools` 仅支持 `type:"function"`，`web_search`/`file_search`/`computer_use` 静默跳过
+- 图片输入（Responses API 的 `input_image` 块）还没进 Responses 路径 —— `/v1/chat/completions` 与 `/v1/messages` 均已支持，跟进一版
+
+### 版本
+- `1.3.8-go` → `1.4.0-go`（minor bump：新 API surface）
+
 ## [1.3.8-go] — 2026-04-22
 
 修复 Claude Code 通过 `/v1/messages` 走反代时"**上下文消失 + 返回空白**"的三个根因。

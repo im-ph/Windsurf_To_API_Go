@@ -50,6 +50,7 @@ func Handler(d *Deps) http.Handler {
 	mux.Handle("/v1/models", d.authMiddleware(http.HandlerFunc(d.ModelsList)))
 	mux.Handle("/v1/chat/completions", d.authMiddleware(http.HandlerFunc(d.ChatCompletions)))
 	mux.Handle("/v1/messages", d.authMiddleware(http.HandlerFunc(d.Messages)))
+	mux.Handle("/v1/responses", d.authMiddleware(http.HandlerFunc(d.Responses)))
 
 	// Dashboard SPA + API.
 	mux.HandleFunc("/dashboard", servePanel)
