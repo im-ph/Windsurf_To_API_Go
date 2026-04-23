@@ -8,4 +8,4 @@ package version
 // String is what /health, the dashboard overview card, and the CLI banner
 // all report. Bump on every release; scripts grep for the literal so don't
 // format-change without updating deploy tooling too.
-const String = "1.4.0-go"
+const String = "1.4.1-go"
