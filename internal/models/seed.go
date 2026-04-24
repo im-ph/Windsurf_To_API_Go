@@ -26,6 +26,16 @@ var seed = map[string]Info{
 	"claude-opus-4.6":               {Name: "claude-opus-4.6", Provider: "anthropic", ModelUID: "claude-opus-4-6", Credit: 6},
 	"claude-opus-4.6-thinking":      {Name: "claude-opus-4.6-thinking", Provider: "anthropic", ModelUID: "claude-opus-4-6-thinking", Credit: 8},
 
+	// Opus 4.7 ships upstream as 5 reasoning tiers (low / medium / high /
+	// xhigh / max) rather than a single model; credits estimated from the
+	// 4.5 / 4.6 progression, override via runtime catalog fetch if cloud
+	// creditMultiplier disagrees.
+	"claude-opus-4.7-low":    {Name: "claude-opus-4.7-low", Provider: "anthropic", ModelUID: "claude-opus-4-7-low", Credit: 4},
+	"claude-opus-4.7-medium": {Name: "claude-opus-4.7-medium", Provider: "anthropic", ModelUID: "claude-opus-4-7-medium", Credit: 5},
+	"claude-opus-4.7-high":   {Name: "claude-opus-4.7-high", Provider: "anthropic", ModelUID: "claude-opus-4-7-high", Credit: 6},
+	"claude-opus-4.7-xhigh":  {Name: "claude-opus-4.7-xhigh", Provider: "anthropic", ModelUID: "claude-opus-4-7-xhigh", Credit: 8},
+	"claude-opus-4.7-max":    {Name: "claude-opus-4.7-max", Provider: "anthropic", ModelUID: "claude-opus-4-7-max", Credit: 10},
+
 	// ── GPT (OpenAI) ──
 	"gpt-4o":      {Name: "gpt-4o", Provider: "openai", Enum: 109, ModelUID: "MODEL_CHAT_GPT_4O_2024_08_06", Credit: 1},
 	"gpt-4o-mini": {Name: "gpt-4o-mini", Provider: "openai", Enum: 113, Credit: 0.5},

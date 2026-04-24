@@ -23,8 +23,11 @@ var DefaultPricing = Pricing{InputPerM: 1.00, OutputPerM: 5.00}
 // price. Keep keys in sync with internal/models/seed.go.
 var ModelPricing = map[string]Pricing{
 	// ─── Anthropic Claude ──────────────────────────────────
-	"claude-opus-4-7":            {15.00, 75.00},
-	"claude-opus-4-7-max":        {15.00, 75.00},
+	"claude-opus-4.7-low":        {15.00, 75.00},
+	"claude-opus-4.7-medium":     {15.00, 75.00},
+	"claude-opus-4.7-high":       {15.00, 75.00},
+	"claude-opus-4.7-xhigh":      {15.00, 75.00},
+	"claude-opus-4.7-max":        {15.00, 75.00},
 	"claude-opus-4.6":            {15.00, 75.00},
 	"claude-opus-4.5":            {15.00, 75.00},
 	"claude-opus-4.6-thinking":   {15.00, 75.00},

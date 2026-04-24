@@ -5,6 +5,32 @@
 
 ---
 
+## [1.4.15] - 2026-04-23
+
+### 新增
+- **Claude Opus 4.7 全系 5 档 seed 条目**：对照生产云端目录，补齐
+  `claude-opus-4.7-{low,medium,high,xhigh,max}`，pricing.go 同步
+  5 条 USD/M token 价（15/75，Anthropic Opus 公价）。之前 pricing 有
+  两条 hyphen-style 孤儿条目（`claude-opus-4-7` / `-max`），删掉避免
+  混淆——真实统计走 `info.Name`（dot-style）查价，hyphen key 永远
+  命中不到。
+
+### 下线
+- **BYOK 4 个账单层变体**：`model-claude-4-opus-byok` /
+  `-opus-thinking-byok` / `-sonnet-byok` / `-sonnet-thinking-byok`。
+  上游把"Bring-Your-Own-Key"走的请求标成独立 modelUid 做账单分流，
+  但本反代池用的就是 Windsurf 的共享账号池——对外暴露这 4 个只会
+  让用户在模型选择器里看到近似重复项，误选后路由到同一个底层模型。
+  `models.MergeCloud` 里 hardcode 过滤 `*-byok` 后缀，不走 model-access
+  blocklist（避免 blocklist 被清空后又冒出来）。
+
+### 涉及文件
+- `internal/models/seed.go`：5 条 Opus 4.7 seed entries。
+- `internal/models/pricing.go`：5 条 Opus 4.7 定价；删 2 条 hyphen 孤儿。
+- `internal/models/catalog.go`：`MergeCloud` 追加 BYOK 过滤（`strings.HasSuffix(..., "-byok")`）。
+
+---
+
 ## [1.4.14] - 2026-04-23
 
 ### 修复（异常监测漏记）

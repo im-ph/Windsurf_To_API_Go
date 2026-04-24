@@ -113,6 +113,22 @@ func MergeCloud(entries []CloudModel) int {
 		if m.ModelUID == "" {
 			continue
 		}
+		// Suppress BYOK (Bring-Your-Own-Key) variants. Upstream ships
+		// `MODEL_..._BYOK` / `model-...-byok` entries as billing-layer
+		// aliases — they route to the same underlying model as the non-
+		// BYOK uid but let Windsurf account quota against the caller's
+		// own provider key instead of Windsurf's pool. For this reverse
+		// proxy the provider key IS Windsurf's pooled key, so there's
+		// no routing advantage, and exposing 4 near-duplicate entries
+		// in the model picker confuses end-users. Normalize underscore
+		// → hyphen before suffix-matching because upstream emits both
+		// `MODEL_CLAUDE_4_OPUS_BYOK` and `model-claude-4-opus-byok`.
+		// Filtered here rather than via model-access blocklist so the
+		// filter survives a blocklist wipe.
+		normalized := strings.ToLower(strings.ReplaceAll(m.ModelUID, "_", "-"))
+		if strings.HasSuffix(normalized, "-byok") {
+			continue
+		}
 		if _, ok := lookup[m.ModelUID]; ok {
 			continue
 		}
