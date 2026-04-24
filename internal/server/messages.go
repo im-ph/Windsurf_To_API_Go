@@ -448,8 +448,35 @@ type anthropicToolBuf struct {
 	BlockIx int
 }
 
+// send writes one Anthropic SSE frame (event: / data: / blank line).
+//
+// Defence in depth against "SyntaxError: Unexpected identifier 'Error'"
+// the Anthropic client SDK throws when a data line is not JSON-parseable:
+//
+//   1. json.Marshal errors are explicit (the silent `_ =` from before
+//      would have written an empty body as `data: \n\n`, also invalid).
+//   2. A round-trip json.Unmarshal verifies the Marshal output itself
+//      is parseable — if any control character or encoding quirk slipped
+//      through we drop the frame rather than poison the client stream.
+//   3. logx.Debug records the first 200 bytes of every outgoing data
+//      line, so when a real "which frame crashed the client" question
+//      arrives we can `journalctl | grep 'sse →'` and read it back.
 func (t *anthropicTranslator) send(event string, data any) {
-	b, _ := json.Marshal(data)
+	b, err := json.Marshal(data)
+	if err != nil {
+		logx.Warn("sse send: marshal failed event=%s err=%s", event, err.Error())
+		return
+	}
+	// Round-trip verification — catches the pathological cases where the
+	// encoder would emit bytes json.Unmarshal can't read back (which is
+	// effectively what the client's JSON.parse does).
+	var verify any
+	if err := json.Unmarshal(b, &verify); err != nil {
+		logx.Warn("sse send: produced un-parseable JSON event=%s bytes=%.200q err=%s",
+			event, b, err.Error())
+		return
+	}
+	logx.Debug("sse → event=%s data=%.200s", event, b)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	fmt.Fprintf(t.w, "event: %s\ndata: %s\n\n", event, b)
@@ -508,6 +535,13 @@ func (t *anthropicTranslator) emitTextDelta(text string) {
 	if text == "" {
 		return
 	}
+	// Anthropic SSE requires message_start as the FIRST event. When this
+	// emitter is entered through an early-error path (streamShim.drain
+	// surfacing an upstream HTTP error as a text block) processChunk
+	// hasn't fired yet, so startMessage was never triggered. Without
+	// this line the first event the client sees is content_block_start,
+	// which some SDK versions reject outright.
+	t.startMessage()
 	if t.curType != "text" {
 		t.startBlock("text", nil)
 	}
@@ -521,6 +555,7 @@ func (t *anthropicTranslator) emitThinkingDelta(text string) {
 	if text == "" {
 		return
 	}
+	t.startMessage()
 	if t.curType != "thinking" {
 		t.startBlock("thinking", nil)
 	}
@@ -531,6 +566,7 @@ func (t *anthropicTranslator) emitThinkingDelta(text string) {
 }
 
 func (t *anthropicTranslator) emitToolCallDelta(idx int, id, name, argsChunk string) {
+	t.startMessage()
 	buf, ok := t.toolBufs[idx]
 	if !ok {
 		// new tool_use — start a new content block.

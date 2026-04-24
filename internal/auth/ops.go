@@ -5,7 +5,6 @@ package auth
 import (
 	"context"
 	"regexp"
-	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +21,38 @@ import (
 // names should be added explicitly rather than widened here.
 var proTierRE = regexp.MustCompile(`(?i)\b(pro|teams|enterprise|trial|individual|premium|paid)\b`)
 var freeTierRE = regexp.MustCompile(`(?i)\bfree\b`)
+
+// IsRateLimitError detects "upstream told us this account is over quota"
+// in every phrasing Cascade / Codeium has returned in production. Shared
+// by the canary probe and the chat classifier so both paths agree on
+// what counts as a rate limit (and therefore get logged into banhistory).
+// Keep in sync — missing a phrasing here means Probe / classify silently
+// skip past a real quota event.
+var rateLimitRE = regexp.MustCompile(
+	`(?i)rate[ _-]?limit` +
+		`|too many requests` +
+		`|\bquota\b` +
+		`|daily (limit|cap)` +
+		`|(message|usage|request)s? (limit|cap) (reached|exceeded|hit)` +
+		`|(limit|quota) exceeded` +
+		`|exceeded (your )?(daily|weekly|monthly) (message|usage|request)` +
+		`|retry[ _-]?after`)
+
+// IsRateLimitError reports whether err looks like any flavour of
+// upstream rate-limit / quota signal.
+func IsRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return rateLimitRE.MatchString(err.Error())
+}
+
+// IsRateLimitMessage is IsRateLimitError for a bare message string —
+// chat.go's classify already has the message extracted and avoids the
+// allocation of wrapping it back in an error.
+func IsRateLimitMessage(msg string) bool {
+	return msg != "" && rateLimitRE.MatchString(msg)
+}
 
 // AddByToken exchanges an auth token with Codeium and inserts the resulting
 // account. Returns an existing account if the api key is already in the pool.
@@ -327,8 +358,17 @@ func (p *Pool) Probe(ctx context.Context, id string, probe ProbeFunc) *ProbeResu
 			logx.Info("  %s: OK", m)
 			continue
 		}
-		if strings.Contains(strings.ToLower(err.Error()), "rate limit") {
-			logx.Info("  %s: RATE_LIMITED (skipped)", m)
+		if IsRateLimitError(err) {
+			// Treat probe-observed rate limits the same as live-request
+			// ones: quarantine the (account, model) pair for 5 min and
+			// append to banhistory so the dashboard "异常监测" panel
+			// actually reflects what Probe saw. Previously this branch
+			// only printed an Info log, so rate-limit events detected by
+			// the 6h probe cycle never made it into history — operators
+			// would see models drop off the live Bans view with no trace
+			// of why.
+			p.MarkRateLimited(apiKey, 5*time.Minute, m)
+			logx.Warn("  %s: RATE_LIMITED (probe) — quarantined 5m", m)
 			continue
 		}
 		p.UpdateCapability(apiKey, m, false, "model_error")

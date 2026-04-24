@@ -454,7 +454,9 @@ type chatErr struct {
 }
 
 var (
-	reRateLimit = regexp.MustCompile(`(?i)rate limit|rate_limit|too many requests|quota`)
+	// rate-limit phrasing now lives in auth.rateLimitRE so Probe and classify
+	// agree on coverage (banhistory loses the event otherwise). Use
+	// auth.IsRateLimitMessage(msg) below.
 	reInternal  = regexp.MustCompile(`(?i)internal error occurred.*error id`)
 	reAuthFail  = regexp.MustCompile(`(?i)unauthenticated|invalid api key|invalid_grant|permission_denied.*account`)
 
@@ -593,7 +595,7 @@ func classify(err error) *chatErr {
 		out.status = http.StatusForbidden
 		out.typ = "model_not_available"
 	}
-	if reRateLimit.MatchString(msg) {
+	if auth.IsRateLimitMessage(msg) {
 		out.isRateLimit = true
 		out.isModel = true
 		out.status = http.StatusTooManyRequests

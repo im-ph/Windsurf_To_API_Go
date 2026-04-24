@@ -5,6 +5,63 @@
 
 ---
 
+## [1.4.14] - 2026-04-23
+
+### 修复（异常监测漏记）
+- **Capability Probe 的 rate-limit 分支不写 banhistory**：
+  [`auth/ops.go`](internal/auth/ops.go) 的 `Probe` 在 canary 命中 rate-limit
+  时之前只打 `logx.Info`、直接 `continue`，不调 `MarkRateLimited` —
+  banhistory 没记录，dashboard "异常监测 / 历史记录"漏掉了 6 小时周期探测
+  发现的所有限速事件。改为命中时 `p.MarkRateLimited(apiKey, 5m, model)`
+  + `logx.Warn`。
+- **`reRateLimit` 正则覆盖不全**：旧正则只认 `rate limit` / `rate_limit` /
+  `too many requests` / `quota` 四种措辞。Cascade 也会返回 `daily limit
+  reached` / `message limit exceeded` / `usage limit hit` / `retry-after`
+  等形式，旧分类漏判 → 走 `isModel` 分支 → 只 `UpdateCapability("model_error")`
+  不 `MarkRateLimited` → banhistory 不记。新正则扩到 8 类措辞，Probe 和
+  `classify` 通过 `auth.IsRateLimitMessage` 共享同一规则，不会再分叉。
+
+### 新增
+- `auth.IsRateLimitError(err) bool` / `auth.IsRateLimitMessage(msg string) bool`
+  — 单一判定入口，外部包可调用。
+- `internal/auth/ops_test.go` 29 条单测覆盖 17 种已知 rate-limit 措辞 +
+  10 种不应误判的错误（auth/precondition/context-canceled/transport 等）。
+
+### 涉及文件
+- `internal/auth/ops.go`：`rateLimitRE`、`IsRateLimitError`、`IsRateLimitMessage`、
+  Probe rate-limit 分支从 log-only 改为 MarkRateLimited。
+- `internal/server/chat.go`：`reRateLimit` 删除，`classify` 改用
+  `auth.IsRateLimitMessage`。
+- `internal/auth/ops_test.go`：新增。
+
+---
+
+## [1.4.13] - 2026-04-23
+
+### 修复
+- **Anthropic SSE 事件顺序**：`emitTextDelta` / `emitThinkingDelta` /
+  `emitToolCallDelta` 入口都强制先 `startMessage()`，保证
+  `message_start` 永远是流的第一个事件。早期错误路径（如 `streamShim.drain`
+  把上游 HTTP 错误转 text_delta）之前会先发 `content_block_start`，
+  部分 SDK 会拒绝这种顺序。
+- **SSE 出站 JSON 校验**：`send()` 在 `json.Marshal` 之后加一次
+  `json.Unmarshal` 回路验证；若产生的字节客户端 parse 不回来就丢帧 +
+  `logx.Warn`，不再把非法 JSON 写给客户端。原实现忽略了 `json.Marshal`
+  的 error（`_, _ :=`），异常情况下会 `data: \n\n` 写空体触发客户端
+  `SyntaxError`。
+
+### 新增
+- 出站 SSE 诊断日志：`sse → event=... data=...` 的 `logx.Debug` 行，
+  `journalctl -u windsurfapi | grep 'sse →'` 可直接看到每个发给客户端
+  的 Anthropic 事件内容（前 200 字节）。排查 `Unexpected identifier
+  "Error"` 这类未复现的客户端解析错误时用。
+
+### 涉及文件
+- `internal/server/messages.go`：`send`、`emitTextDelta`、
+  `emitThinkingDelta`、`emitToolCallDelta`。
+
+---
+
 ## [1.4.12] - 2026-04-23
 
 ### 新增
