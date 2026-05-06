@@ -1,6 +1,6 @@
 # WindsurfAPI — Go rewrite
 
-> 当前版本 · **1.4.14-go**（2026-04-23）
+> 当前版本 · **1.4.17-go**（2026-05-06）
 > 变更摘要见 [CHANGELOG.md](CHANGELOG.md)。
 
 Drop-in Go port of the Node.js service. **9,300+ lines**, **single static

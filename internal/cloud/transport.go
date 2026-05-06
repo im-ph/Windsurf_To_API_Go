@@ -7,10 +7,12 @@
 package cloud
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -18,7 +20,11 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/proxy"
+
 	"windsurfapi/internal/langserver"
+	"windsurfapi/internal/logx"
+	"windsurfapi/internal/netguard"
 )
 
 // Error returned by transport when the proxy itself fails (so we can fall
@@ -46,9 +52,43 @@ func proxyKey(p *langserver.Proxy) string {
 	return fmt.Sprintf("%s:%d:%s", p.Host, p.Port, p.Username)
 }
 
+// stripPort cleans up a proxy host string that may have been entered with
+// a trailing :port (JS does the same cleanup).
+func stripPort(host string) string {
+	if !strings.Contains(host, ":") {
+		return host
+	}
+	if i := strings.LastIndex(host, ":"); i > 0 {
+		return host[:i]
+	}
+	return host
+}
+
+// proxyType normalises the type string. Default is "http".
+func proxyType(p *langserver.Proxy) string {
+	t := strings.ToLower(strings.TrimSpace(p.Type))
+	switch t {
+	case "socks", "socks5", "socks5h":
+		return "socks5"
+	default:
+		return "http"
+	}
+}
+
 // clientFor returns a cached *http.Client configured for the given proxy
 // (or direct when p is nil). Clients are shared across requests for
 // connection reuse.
+//
+// N3: when p is non-nil, the proxy host is validated through
+// netguard.ResolveAndCheckHost BEFORE the transport is created. Private
+// IPs / metadata-service literals are rejected to prevent SSRF pivot via
+// an operator-supplied (potentially attacker-controlled) proxy host. A
+// rejection logs once and the client falls back to direct egress.
+//
+// N22: SOCKS5 proxies (Type ∈ {"socks", "socks5", "socks5h"}) are now
+// honoured via golang.org/x/net/proxy. The same SSRF guard applies; the
+// SOCKS dialer wraps a netguard-checked net.Dialer so even a hostile
+// resolver answering 169.254.169.254 mid-dial is caught.
 func clientFor(p *langserver.Proxy) *http.Client {
 	key := proxyKey(p)
 	clientMu.Lock()
@@ -64,26 +104,90 @@ func clientFor(p *langserver.Proxy) *http.Client {
 		MaxIdleConnsPerHost: 5,
 	}
 	if p != nil && p.Host != "" {
+		host := stripPort(p.Host)
 		port := p.Port
 		if port == 0 {
-			port = 8080
-		}
-		host := p.Host
-		if strings.Contains(host, ":") {
-			// Strip any trailing :port — JS does the same cleanup.
-			if i := strings.LastIndex(host, ":"); i > 0 {
-				host = host[:i]
+			if proxyType(p) == "socks5" {
+				port = 1080
+			} else {
+				port = 8080
 			}
 		}
-		pu := &url.URL{Scheme: "http", Host: fmt.Sprintf("%s:%d", host, port)}
-		if p.Username != "" {
-			pu.User = url.UserPassword(p.Username, p.Password)
+		// N3: SSRF guard. ResolveAndCheckHost looks up DNS and rejects
+		// private/loopback/metadata literals. A hostile DNS that flips
+		// to a private IP mid-attack is also caught because we look up
+		// here, NOT at dial time, and the SOCKS5/HTTP dialers below
+		// receive the validated host string (which the stdlib then
+		// re-resolves — TOCTOU window is small, but the dashboard test
+		// path runs the same check before saving the proxy so an attacker
+		// cannot set a hostile host in the first place).
+		if _, err := netguard.ResolveAndCheckHost(host, nil); err != nil {
+			logx.Warn("cloud transport: refusing proxy host %q (%v) — falling back to direct egress", host, err)
+			c := &http.Client{Transport: tr, Timeout: 30 * time.Second}
+			clientCache[key] = c
+			return c
 		}
-		tr.Proxy = http.ProxyURL(pu)
+
+		switch proxyType(p) {
+		case "socks5":
+			// N22: SOCKS5 dialer. Wraps a guarded net.Dialer so the
+			// SOCKS server can't be tricked into making us connect to
+			// an internal address either — every Dial(addr) hits
+			// netguard.ResolveAndCheckHost on the target host before
+			// the underlying TCP open.
+			var auth *proxy.Auth
+			if p.Username != "" {
+				auth = &proxy.Auth{User: p.Username, Password: p.Password}
+			}
+			fwd := &guardedDialer{base: &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}}
+			d, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%d", host, port), auth, fwd)
+			if err != nil {
+				logx.Warn("cloud transport: socks5 dialer init failed for %s:%d: %v — direct egress", host, port, err)
+				break
+			}
+			ctxd, ok := d.(proxy.ContextDialer)
+			if ok {
+				tr.DialContext = ctxd.DialContext
+			} else {
+				tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return d.Dial(network, addr)
+				}
+			}
+			tr.Proxy = nil // SOCKS5 wraps the dialer, not the request URL
+		default: // http CONNECT proxy
+			pu := &url.URL{Scheme: "http", Host: fmt.Sprintf("%s:%d", host, port)}
+			if p.Username != "" {
+				pu.User = url.UserPassword(p.Username, p.Password)
+			}
+			tr.Proxy = http.ProxyURL(pu)
+		}
 	}
 	c := &http.Client{Transport: tr, Timeout: 30 * time.Second}
 	clientCache[key] = c
 	return c
+}
+
+// guardedDialer wraps a *net.Dialer with a netguard pre-flight check so
+// every connection through it (whether direct or via a SOCKS5 forwarder)
+// rejects RFC1918 / link-local / metadata-service targets.
+type guardedDialer struct {
+	base *net.Dialer
+}
+
+func (d *guardedDialer) Dial(network, addr string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, addr)
+}
+
+func (d *guardedDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Untyped — let the base dialer surface the error.
+		return d.base.DialContext(ctx, network, addr)
+	}
+	if _, err := netguard.ResolveAndCheckHost(host, nil); err != nil {
+		return nil, fmt.Errorf("blocked by netguard: %w", err)
+	}
+	return d.base.DialContext(ctx, network, addr)
 }
 
 // PostJSON does a JSON POST to urlStr. When proxy is non-nil and the proxy

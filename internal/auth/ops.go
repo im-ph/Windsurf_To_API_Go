@@ -334,7 +334,43 @@ type ProbeResult struct {
 // probeFunc keeps this package free of a direct dependency on client+langserver.
 type ProbeFunc func(ctx context.Context, apiKey, modelKey string) error
 
+// N16 — probe singleflight. Concurrent dashboard "probe-all" + scheduled
+// re-probe + manual probe for the same id must NOT start parallel canary
+// requests that burn RPM. probeFlight holds an in-flight result channel
+// per account so all callers share one Probe execution.
+type probeFlight struct {
+	done chan struct{}
+	res  *ProbeResult
+}
+
+var (
+	probesMu      sync.Mutex
+	probesInFlight = map[string]*probeFlight{}
+)
+
 func (p *Pool) Probe(ctx context.Context, id string, probe ProbeFunc) *ProbeResult {
+	// N16: deduplicate. If a probe is already in flight for this id,
+	// wait on the shared result rather than starting fresh canaries.
+	probesMu.Lock()
+	if f, ok := probesInFlight[id]; ok {
+		probesMu.Unlock()
+		select {
+		case <-f.done:
+			return f.res
+		case <-ctx.Done():
+			return nil
+		}
+	}
+	flight := &probeFlight{done: make(chan struct{})}
+	probesInFlight[id] = flight
+	probesMu.Unlock()
+	defer func() {
+		probesMu.Lock()
+		delete(probesInFlight, id)
+		probesMu.Unlock()
+		close(flight.done)
+	}()
+
 	p.mu.RLock()
 	var apiKey, email string
 	var known bool
@@ -392,7 +428,9 @@ func (p *Pool) Probe(ctx context.Context, id string, probe ProbeFunc) *ProbeResu
 			for k, v := range a.Capabilities {
 				caps[k] = v
 			}
-			return &ProbeResult{Tier: a.Tier, Capabilities: caps}
+			res := &ProbeResult{Tier: a.Tier, Capabilities: caps}
+			flight.res = res
+			return res
 		}
 	}
 	return nil

@@ -394,6 +394,151 @@ func (p *Pool) Counts() Counts {
 	return c
 }
 
+// ─── N18 — Drought mode ───────────────────────────────────────
+//
+// When EVERY active account whose Credits we have probed reports a weekly
+// quota below DroughtThreshold percent, the pool is in "drought mode".
+// chat.go short-circuits premium-model requests with 503 in that state —
+// the few remaining percentage points of weekly quota are reserved for
+// users who explicitly downshift to a free-tier model.
+//
+// Free-tier-shared models (gpt-4o-mini, gemini-2.5-flash, glm-4.7,
+// kimi-k2, qwen-3) bypass the gate even in drought mode because they
+// don't consume the same premium quota pool.
+const DroughtThreshold = 5.0
+
+var droughtFreeModels = map[string]bool{
+	"gpt-4o-mini":      true,
+	"gemini-2.5-flash": true,
+	"glm-4.7":          true,
+	"kimi-k2":          true,
+	"qwen-3":           true,
+}
+
+func quotaPercent(a *Account) float64 {
+	if a == nil || a.Credits == nil {
+		return 100
+	}
+	w := a.Credits.WeeklyPercent
+	d := a.Credits.DailyPercent
+	if w == 0 && d == 0 {
+		return 100 // no signal — assume plenty
+	}
+	if w == 0 {
+		return d
+	}
+	if d == 0 {
+		return w
+	}
+	if w < d {
+		return w
+	}
+	return d
+}
+
+// IsDroughtMode reports whether every active account with known quota
+// percentages is below DroughtThreshold. False when the pool has no
+// quota signal at all (no account has been credit-probed yet) — better
+// to attempt routing than 503-block on missing data.
+func (p *Pool) IsDroughtMode() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	knownCount := 0
+	below := 0
+	for _, a := range p.accounts {
+		if a.Status != StatusActive {
+			continue
+		}
+		if a.Credits == nil {
+			continue
+		}
+		if a.Credits.WeeklyPercent == 0 && a.Credits.DailyPercent == 0 {
+			continue
+		}
+		knownCount++
+		if quotaPercent(a) < DroughtThreshold {
+			below++
+		}
+	}
+	if knownCount == 0 {
+		return false
+	}
+	return below == knownCount
+}
+
+// IsModelBlockedByDrought reports whether modelKey should be 503-blocked
+// because of drought mode. Free-tier-shared models stay routable.
+func (p *Pool) IsModelBlockedByDrought(modelKey string) bool {
+	if !p.IsDroughtMode() {
+		return false
+	}
+	if droughtFreeModels[modelKey] {
+		return false
+	}
+	return true
+}
+
+// DroughtSummary is the dashboard-visible projection of drought state.
+type DroughtSummary struct {
+	Drought        bool                  `json:"drought"`
+	Threshold      float64               `json:"threshold"`
+	ActiveAccounts int                   `json:"activeAccounts"`
+	Accounts       []DroughtAccountEntry `json:"accounts"`
+}
+
+// DroughtAccountEntry is one row in DroughtSummary.Accounts.
+type DroughtAccountEntry struct {
+	ID      string  `json:"id"`
+	Percent float64 `json:"percent"`
+}
+
+// GetDroughtSummary builds the dashboard projection of drought state.
+func (p *Pool) GetDroughtSummary() DroughtSummary {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := DroughtSummary{
+		Drought:   p.isDroughtModeLocked(),
+		Threshold: DroughtThreshold,
+	}
+	for _, a := range p.accounts {
+		if a.Status != StatusActive {
+			continue
+		}
+		out.ActiveAccounts++
+		out.Accounts = append(out.Accounts, DroughtAccountEntry{
+			ID:      a.ID,
+			Percent: quotaPercent(a),
+		})
+	}
+	return out
+}
+
+// isDroughtModeLocked is the lock-held variant for callers (like
+// GetDroughtSummary) that already hold p.mu.
+func (p *Pool) isDroughtModeLocked() bool {
+	knownCount := 0
+	below := 0
+	for _, a := range p.accounts {
+		if a.Status != StatusActive {
+			continue
+		}
+		if a.Credits == nil {
+			continue
+		}
+		if a.Credits.WeeklyPercent == 0 && a.Credits.DailyPercent == 0 {
+			continue
+		}
+		knownCount++
+		if quotaPercent(a) < DroughtThreshold {
+			below++
+		}
+	}
+	if knownCount == 0 {
+		return false
+	}
+	return below == knownCount
+}
+
 // IsAuthenticated reports whether any active account exists.
 func (p *Pool) IsAuthenticated() bool {
 	p.mu.RLock()

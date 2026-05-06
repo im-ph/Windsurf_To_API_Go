@@ -106,8 +106,23 @@ func servePanel(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeSPAIndex(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Cache-Control", "no-store")
+	// B-P2-4 + F-P2-1 + F-P2-2: defense-in-depth security headers on the
+	// dashboard HTML response.
+	//   X-Frame-Options: DENY            — clickjacking prevention (legacy UAs)
+	//   frame-ancestors 'none'           — modern equivalent via CSP
+	//   X-Content-Type-Options: nosniff  — block MIME sniffing
+	//   Referrer-Policy: same-origin     — don't leak admin URL on outbound clicks
+	// The CSP allows inline script/style because the Vite-built bundle uses
+	// runtime-injected styles. `connect-src 'self'` keeps the dashboard's
+	// API calls scoped; `object-src 'none'` and `base-uri 'none'` close
+	// classic XSS amplification vectors.
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "same-origin")
+	h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(dashboardIndex)
 }
@@ -202,9 +217,12 @@ func bearerToken(r *http.Request) string {
 //
 // Headers we set:
 //   - `Content-Encoding: identity` — forbids any transformer from compressing
-//   - `Cache-Control: no-cache, no-transform` — `no-transform` is the RFC
-//     knob that forbids MITM compressors / minifiers (not all proxies honour
-//     it, hence the identity pin above; belt + braces)
+//   - `Cache-Control: no-store, no-transform` — `no-store` (N6) prevents
+//     intermediate caches and aggregators (sub2api priority cache, nginx
+//     `proxy_cache`) from serving one tenant's response to another;
+//     `no-transform` is the RFC knob that forbids MITM compressors /
+//     minifiers (not all proxies honour it, hence the identity pin above;
+//     belt + braces).
 //   - `X-Accel-Buffering: no` — nginx / Caddy-with-ngx-compat convention to
 //     disable proxy_buffering per-response
 //
@@ -217,7 +235,7 @@ func noCompress(next http.Handler) http.Handler {
 		r.Header.Del("Accept-Encoding")
 		h := w.Header()
 		h.Set("Content-Encoding", "identity")
-		h.Set("Cache-Control", "no-cache, no-transform")
+		h.Set("Cache-Control", "no-store, no-transform")
 		h.Set("X-Accel-Buffering", "no")
 		next.ServeHTTP(w, r)
 	})

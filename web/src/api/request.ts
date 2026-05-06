@@ -3,15 +3,28 @@ import { message } from 'ant-design-vue';
 
 const DASHBOARD_PASSWORD_KEY = 'windsurfapi:dashboard-password';
 
+// F-P1-3: dashboard password lives in sessionStorage, not localStorage.
+// localStorage persists across tab close + is readable by any same-origin
+// JS — a single XSS would lift the password permanently. sessionStorage
+// dies with the tab. Migrate any legacy localStorage entry on first load
+// so existing users don't get logged out, then clear it.
 export function getStoredPassword(): string {
-  return localStorage.getItem(DASHBOARD_PASSWORD_KEY) ?? '';
+  const cached = sessionStorage.getItem(DASHBOARD_PASSWORD_KEY);
+  if (cached) return cached;
+  const legacy = localStorage.getItem(DASHBOARD_PASSWORD_KEY);
+  if (legacy) {
+    sessionStorage.setItem(DASHBOARD_PASSWORD_KEY, legacy);
+    try { localStorage.removeItem(DASHBOARD_PASSWORD_KEY); } catch { /* noop */ }
+    return legacy;
+  }
+  return '';
 }
 
 export function setStoredPassword(pw: string): void {
   if (pw) {
-    localStorage.setItem(DASHBOARD_PASSWORD_KEY, pw);
+    sessionStorage.setItem(DASHBOARD_PASSWORD_KEY, pw);
   } else {
-    localStorage.removeItem(DASHBOARD_PASSWORD_KEY);
+    sessionStorage.removeItem(DASHBOARD_PASSWORD_KEY);
   }
 }
 

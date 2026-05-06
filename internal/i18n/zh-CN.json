@@ -1,0 +1,163 @@
+{
+  "$meta": {
+    "code": "zh-CN",
+    "name": "简体中文",
+    "version": 1
+  },
+  "common": {
+    "loading": "加载中…",
+    "save": "保存",
+    "cancel": "取消",
+    "confirm": "确认",
+    "delete": "删除",
+    "edit": "编辑",
+    "add": "添加",
+    "refresh": "刷新",
+    "search": "搜索",
+    "all": "全部",
+    "yes": "是",
+    "no": "否",
+    "enabled": "已启用",
+    "disabled": "已禁用",
+    "active": "活跃",
+    "error": "错误",
+    "warning": "警告",
+    "success": "成功",
+    "back": "返回",
+    "close": "关闭",
+    "copy": "复制",
+    "copied": "已复制",
+    "details": "详情",
+    "more": "更多",
+    "loadMore": "加载更多",
+    "empty": "暂无数据"
+  },
+  "nav": {
+    "overview": "总览",
+    "loginTake": "登录取号",
+    "accounts": "账号管理",
+    "models": "模型控制",
+    "proxy": "代理",
+    "logs": "日志",
+    "stats": "统计",
+    "bans": "封禁监测",
+    "experimental": "实验功能",
+    "language": "语言"
+  },
+  "overview": {
+    "title": "总览",
+    "uptime": "运行时间",
+    "totalRequests": "请求总数",
+    "successRate": "成功率",
+    "activeAccounts": "活跃账号",
+    "lsStatus": "Language Server",
+    "running": "运行中",
+    "stopped": "已停止"
+  },
+  "accounts": {
+    "title": "账号管理",
+    "id": "ID",
+    "email": "邮箱",
+    "status": "状态",
+    "tier": "层级",
+    "errorCount": "错误数",
+    "lastUsed": "最近使用",
+    "credits": "余额",
+    "rpm": "RPM",
+    "actions": "操作",
+    "addAccount": "添加账号",
+    "probe": "探测",
+    "refreshCredits": "刷新余额",
+    "block": "停用",
+    "unblock": "启用",
+    "resetErrors": "重置错误",
+    "tierPro": "Pro",
+    "tierFree": "Free",
+    "tierUnknown": "未知",
+    "tierExpired": "已过期",
+    "rateLimited": "限流中"
+  },
+  "models": {
+    "title": "模型控制",
+    "modeAll": "全部允许",
+    "modeAllowlist": "白名单",
+    "modeBlocklist": "黑名单",
+    "selectModels": "选择模型",
+    "currentList": "当前清单"
+  },
+  "proxy": {
+    "title": "代理",
+    "global": "全局代理",
+    "perAccount": "每账号代理",
+    "type": "类型",
+    "host": "主机",
+    "port": "端口",
+    "username": "用户名",
+    "password": "密码",
+    "test": "测试",
+    "testResult": "测试结果",
+    "egressIp": "出口 IP"
+  },
+  "logs": {
+    "title": "日志",
+    "level": "等级",
+    "filter": "过滤",
+    "stream": "实时流",
+    "download": "下载"
+  },
+  "stats": {
+    "title": "统计",
+    "perModel": "每模型",
+    "perAccount": "每账号",
+    "p50": "P50",
+    "p95": "P95",
+    "avg": "平均",
+    "requests": "请求",
+    "success": "成功",
+    "errors": "错误",
+    "circuitBreaker": "熔断事件",
+    "rateLimitEvents": "限流",
+    "internalErrorEvents": "内部错误",
+    "quarantineEvents": "隔离",
+    "fallbackEvents": "降级"
+  },
+  "experimental": {
+    "title": "实验功能",
+    "cascadeReuse": "Cascade 会话复用",
+    "modelIdentity": "模型身份注入",
+    "preflightRateLimit": "预检限流"
+  },
+  "drought": {
+    "title": "Drought 模式",
+    "active": "已激活 — 所有账号本周配额接近耗尽",
+    "threshold": "阈值",
+    "weeklyPercent": "本周剩余配额"
+  },
+  "errors": {
+    "rateLimit": "{model} 所有账号均已达速率限制，请 {seconds} 秒后重试",
+    "modelBlocked": "模型已被封锁",
+    "droughtMode": "{model} 当前不可用：所有账号本周配额已接近耗尽（drought mode）",
+    "fallback": "已降级到 {fallback}"
+  },
+  "auth": {
+    "loginRequired": "需要登录",
+    "password": "密码",
+    "submit": "提交",
+    "logout": "退出",
+    "tooManyAttempts": "失败次数过多，请稍后再试",
+    "remainingTime": "请等待 {seconds} 秒"
+  },
+  "localWindsurf": {
+    "title": "本机 Windsurf 凭证导入",
+    "scan": "扫描本机",
+    "found": "已找到",
+    "notFound": "未找到本机 Windsurf 安装",
+    "import": "导入",
+    "stable": "稳定版",
+    "next": "Next 版",
+    "insiders": "Insiders 版",
+    "snap": "Snap 版",
+    "sqliteRequired": "需要 sqlite3 工具",
+    "manualHint": "请将 state.vscdb 复制出来并通过 POST /dashboard/api/accounts 手动导入"
+  }
+}

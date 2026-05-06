@@ -47,8 +47,18 @@ type Config struct {
 func Load() *Config {
 	loadDotEnv(".env")
 
+	// N4: bindHost gate. When the operator hasn't set EITHER API_KEY or
+	// DASHBOARD_PASSWORD, default to loopback so an internet-facing
+	// instance can't get accidentally bricked. Setting `ALLOW_OPEN=1`
+	// restores the legacy 0.0.0.0 default for users who genuinely want
+	// an unauthenticated listener (e.g. fronting an internal-only tool).
+	defaultBind := "0.0.0.0"
+	if os.Getenv("API_KEY") == "" && os.Getenv("DASHBOARD_PASSWORD") == "" && os.Getenv("ALLOW_OPEN") != "1" {
+		defaultBind = "127.0.0.1"
+	}
+
 	c := &Config{
-		BindHost:          envStr("BIND_HOST", "0.0.0.0"),
+		BindHost:          envStr("BIND_HOST", defaultBind),
 		Port:              envInt("PORT", 3003),
 		APIKey:            os.Getenv("API_KEY"),
 		CodeiumAuthToken:  os.Getenv("CODEIUM_AUTH_TOKEN"),

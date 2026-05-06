@@ -1,0 +1,163 @@
+{
+  "$meta": {
+    "code": "en",
+    "name": "English",
+    "version": 1
+  },
+  "common": {
+    "loading": "Loading…",
+    "save": "Save",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "delete": "Delete",
+    "edit": "Edit",
+    "add": "Add",
+    "refresh": "Refresh",
+    "search": "Search",
+    "all": "All",
+    "yes": "Yes",
+    "no": "No",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "active": "Active",
+    "error": "Error",
+    "warning": "Warning",
+    "success": "Success",
+    "back": "Back",
+    "close": "Close",
+    "copy": "Copy",
+    "copied": "Copied",
+    "details": "Details",
+    "more": "More",
+    "loadMore": "Load more",
+    "empty": "No data"
+  },
+  "nav": {
+    "overview": "Overview",
+    "loginTake": "Login & Acquire",
+    "accounts": "Accounts",
+    "models": "Models",
+    "proxy": "Proxy",
+    "logs": "Logs",
+    "stats": "Stats",
+    "bans": "Bans",
+    "experimental": "Experimental",
+    "language": "Language"
+  },
+  "overview": {
+    "title": "Overview",
+    "uptime": "Uptime",
+    "totalRequests": "Total requests",
+    "successRate": "Success rate",
+    "activeAccounts": "Active accounts",
+    "lsStatus": "Language Server",
+    "running": "Running",
+    "stopped": "Stopped"
+  },
+  "accounts": {
+    "title": "Accounts",
+    "id": "ID",
+    "email": "Email",
+    "status": "Status",
+    "tier": "Tier",
+    "errorCount": "Errors",
+    "lastUsed": "Last used",
+    "credits": "Credits",
+    "rpm": "RPM",
+    "actions": "Actions",
+    "addAccount": "Add account",
+    "probe": "Probe",
+    "refreshCredits": "Refresh credits",
+    "block": "Block",
+    "unblock": "Unblock",
+    "resetErrors": "Reset errors",
+    "tierPro": "Pro",
+    "tierFree": "Free",
+    "tierUnknown": "Unknown",
+    "tierExpired": "Expired",
+    "rateLimited": "Rate-limited"
+  },
+  "models": {
+    "title": "Models",
+    "modeAll": "Allow all",
+    "modeAllowlist": "Allowlist",
+    "modeBlocklist": "Blocklist",
+    "selectModels": "Select models",
+    "currentList": "Current list"
+  },
+  "proxy": {
+    "title": "Proxy",
+    "global": "Global proxy",
+    "perAccount": "Per-account proxy",
+    "type": "Type",
+    "host": "Host",
+    "port": "Port",
+    "username": "Username",
+    "password": "Password",
+    "test": "Test",
+    "testResult": "Test result",
+    "egressIp": "Egress IP"
+  },
+  "logs": {
+    "title": "Logs",
+    "level": "Level",
+    "filter": "Filter",
+    "stream": "Live stream",
+    "download": "Download"
+  },
+  "stats": {
+    "title": "Stats",
+    "perModel": "Per model",
+    "perAccount": "Per account",
+    "p50": "P50",
+    "p95": "P95",
+    "avg": "Average",
+    "requests": "Requests",
+    "success": "Success",
+    "errors": "Errors",
+    "circuitBreaker": "Circuit breaker events",
+    "rateLimitEvents": "Rate limit",
+    "internalErrorEvents": "Internal error",
+    "quarantineEvents": "Quarantine",
+    "fallbackEvents": "Fallback"
+  },
+  "experimental": {
+    "title": "Experimental",
+    "cascadeReuse": "Cascade conversation reuse",
+    "modelIdentity": "Model identity prompt",
+    "preflightRateLimit": "Pre-flight rate-limit check"
+  },
+  "drought": {
+    "title": "Drought mode",
+    "active": "Active — every account is near its weekly quota cap",
+    "threshold": "Threshold",
+    "weeklyPercent": "Weekly quota remaining"
+  },
+  "errors": {
+    "rateLimit": "{model} is rate-limited on every account; retry in {seconds}s",
+    "modelBlocked": "Model is blocked",
+    "droughtMode": "{model} unavailable: weekly quota near-exhausted across the pool (drought mode)",
+    "fallback": "Fell back to {fallback}"
+  },
+  "auth": {
+    "loginRequired": "Login required",
+    "password": "Password",
+    "submit": "Submit",
+    "logout": "Log out",
+    "tooManyAttempts": "Too many failed attempts; try again later",
+    "remainingTime": "Wait {seconds}s"
+  },
+  "localWindsurf": {
+    "title": "Local Windsurf import",
+    "scan": "Scan host",
+    "found": "Found",
+    "notFound": "No local Windsurf install found",
+    "import": "Import",
+    "stable": "Stable",
+    "next": "Next",
+    "insiders": "Insiders",
+    "snap": "Snap",
+    "sqliteRequired": "sqlite3 CLI required",
+    "manualHint": "Copy state.vscdb out and import the apiKey via POST /dashboard/api/accounts"
+  }
+}

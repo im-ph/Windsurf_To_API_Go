@@ -1,0 +1,24 @@
+# Runtime state (per-deployment, contains secrets):
+accounts.json
+proxy.json
+model-access.json
+runtime-config.json
+runtime-config.json.bak*
+stats.json
+
+# Build artifacts:
+windsurfapi
+windsurfapi.exe
+web/node_modules/
+
+# Tooling state:
+logs/
+q0/
+
+# bin/ holds the language-server binary (LFS), but keep README:
+bin/*
+!bin/README.md
+
+# Editor:
+.vscode/
+.idea/

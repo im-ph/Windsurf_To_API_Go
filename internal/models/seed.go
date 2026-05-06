@@ -85,7 +85,27 @@ var seed = map[string]Info{
 	"gpt-5.2-codex-high-fast":   {Name: "gpt-5.2-codex-high-fast", Provider: "openai", ModelUID: "MODEL_GPT_5_2_CODEX_HIGH_PRIORITY", Credit: 4},
 	"gpt-5.2-codex-xhigh-fast":  {Name: "gpt-5.2-codex-xhigh-fast", Provider: "openai", ModelUID: "MODEL_GPT_5_2_CODEX_XHIGH_PRIORITY", Credit: 6},
 
-	"gpt-5.3-codex": {Name: "gpt-5.3-codex", Provider: "openai", ModelUID: "gpt-5-3-codex-medium", Credit: 1},
+	"gpt-5.3-codex":            {Name: "gpt-5.3-codex", Provider: "openai", ModelUID: "gpt-5-3-codex-medium", Credit: 1},
+	"gpt-5.3-codex-low":        {Name: "gpt-5.3-codex-low", Provider: "openai", ModelUID: "gpt-5-3-codex-low", Credit: 0.5},
+	"gpt-5.3-codex-high":       {Name: "gpt-5.3-codex-high", Provider: "openai", ModelUID: "gpt-5-3-codex-high", Credit: 2},
+	"gpt-5.3-codex-xhigh":      {Name: "gpt-5.3-codex-xhigh", Provider: "openai", ModelUID: "gpt-5-3-codex-xhigh", Credit: 4},
+	"gpt-5.3-codex-low-fast":   {Name: "gpt-5.3-codex-low-fast", Provider: "openai", ModelUID: "gpt-5-3-codex-low-priority", Credit: 1},
+	"gpt-5.3-codex-medium-fast": {Name: "gpt-5.3-codex-medium-fast", Provider: "openai", ModelUID: "gpt-5-3-codex-medium-priority", Credit: 2},
+	"gpt-5.3-codex-high-fast":  {Name: "gpt-5.3-codex-high-fast", Provider: "openai", ModelUID: "gpt-5-3-codex-high-priority", Credit: 4},
+	"gpt-5.3-codex-xhigh-fast": {Name: "gpt-5.3-codex-xhigh-fast", Provider: "openai", ModelUID: "gpt-5-3-codex-xhigh-priority", Credit: 6},
+
+	// GPT-5.5 — Windsurf catalog 2026-04-30. Same effort ladder as 5.2/5.4.
+	"gpt-5.5":             {Name: "gpt-5.5", Provider: "openai", ModelUID: "gpt-5-5-medium", Credit: 2},
+	"gpt-5.5-none":        {Name: "gpt-5.5-none", Provider: "openai", ModelUID: "gpt-5-5-none", Credit: 1},
+	"gpt-5.5-low":         {Name: "gpt-5.5-low", Provider: "openai", ModelUID: "gpt-5-5-low", Credit: 1},
+	"gpt-5.5-medium":      {Name: "gpt-5.5-medium", Provider: "openai", ModelUID: "gpt-5-5-medium", Credit: 2},
+	"gpt-5.5-high":        {Name: "gpt-5.5-high", Provider: "openai", ModelUID: "gpt-5-5-high", Credit: 4},
+	"gpt-5.5-xhigh":       {Name: "gpt-5.5-xhigh", Provider: "openai", ModelUID: "gpt-5-5-xhigh", Credit: 8},
+	"gpt-5.5-none-fast":   {Name: "gpt-5.5-none-fast", Provider: "openai", ModelUID: "gpt-5-5-none-priority", Credit: 2},
+	"gpt-5.5-low-fast":    {Name: "gpt-5.5-low-fast", Provider: "openai", ModelUID: "gpt-5-5-low-priority", Credit: 2},
+	"gpt-5.5-medium-fast": {Name: "gpt-5.5-medium-fast", Provider: "openai", ModelUID: "gpt-5-5-medium-priority", Credit: 4},
+	"gpt-5.5-high-fast":   {Name: "gpt-5.5-high-fast", Provider: "openai", ModelUID: "gpt-5-5-high-priority", Credit: 8},
+	"gpt-5.5-xhigh-fast":  {Name: "gpt-5.5-xhigh-fast", Provider: "openai", ModelUID: "gpt-5-5-xhigh-priority", Credit: 16},
 
 	"gpt-5.4-low":         {Name: "gpt-5.4-low", Provider: "openai", ModelUID: "gpt-5-4-low", Credit: 1},
 	"gpt-5.4-medium":      {Name: "gpt-5.4-medium", Provider: "openai", ModelUID: "gpt-5-4-medium", Credit: 2},
@@ -135,9 +155,10 @@ var seed = map[string]Info{
 	"kimi-k2.5": {Name: "kimi-k2.5", Provider: "moonshot", ModelUID: "kimi-k2-5", Credit: 1},
 
 	// ── GLM ──
-	"glm-4.7": {Name: "glm-4.7", Provider: "zhipu", Enum: 417, ModelUID: "MODEL_GLM_4_7", Credit: 0.25},
-	"glm-5":   {Name: "glm-5", Provider: "zhipu", ModelUID: "glm-5", Credit: 1.5},
-	"glm-5.1": {Name: "glm-5.1", Provider: "zhipu", ModelUID: "glm-5-1", Credit: 1.5},
+	"glm-4.7":      {Name: "glm-4.7", Provider: "zhipu", Enum: 417, ModelUID: "MODEL_GLM_4_7", Credit: 0.25},
+	"glm-4.7-fast": {Name: "glm-4.7-fast", Provider: "zhipu", Enum: 418, ModelUID: "MODEL_GLM_4_7_FAST", Credit: 0.5},
+	"glm-5":        {Name: "glm-5", Provider: "zhipu", ModelUID: "glm-5", Credit: 1.5},
+	"glm-5.1":      {Name: "glm-5.1", Provider: "zhipu", ModelUID: "glm-5-1", Credit: 1.5},
 
 	// ── MiniMax ──
 	"minimax-m2.5": {Name: "minimax-m2.5", Provider: "minimax", ModelUID: "minimax-m2-5", Credit: 1},
@@ -151,4 +172,11 @@ var seed = map[string]Info{
 	// ── Arena ──
 	"arena-fast":  {Name: "arena-fast", Provider: "windsurf", ModelUID: "arena-fast", Credit: 0.5},
 	"arena-smart": {Name: "arena-smart", Provider: "windsurf", ModelUID: "arena-smart", Credit: 1},
+
+	// ── Adaptive (Windsurf model-router) ──
+	// N10: catalog-only entry — server side routes adaptively. `Deprecated`
+	// flag would surface a "this model is upstream-deprecated" badge but we
+	// don't have that field in Info; clients that hard-code the name can
+	// still resolve it through the alias map.
+	"adaptive": {Name: "adaptive", Provider: "windsurf", ModelUID: "adaptive", Credit: 1},
 }

@@ -212,16 +212,37 @@ func rebuildLookup() {
 		"claude-opus-4-7":        "claude-opus-4-7-medium",
 		"claude-opus-4.7":        "claude-opus-4-7-medium",
 		"claude-opus-4-7-latest": "claude-opus-4-7-max",
+		// N15: bare `-thinking` should NOT auto-route to high effort. Pin
+		// to the medium tier so clients wanting another tier pass the
+		// explicit name (claude-opus-4.7-high etc.).
+		"claude-opus-4-7-thinking": "claude-opus-4-7-medium",
+		"claude-opus-4.7-thinking": "claude-opus-4-7-medium",
 
 		// Claude 4.6 dated names (Anthropic SDK convention).
 		"claude-sonnet-4-6-latest":    "claude-sonnet-4.6",
 		"claude-opus-4-6-latest":      "claude-opus-4.6",
 
 		// Claude 4.5 dated rollouts.
-		"claude-opus-4-5-20251101":         "claude-4.5-opus",
-		"claude-sonnet-4-5-20251101":       "claude-4.5-sonnet",
-		"claude-opus-4-5-latest":           "claude-4.5-opus",
-		"claude-sonnet-4-5-latest":         "claude-4.5-sonnet",
+		"claude-opus-4-5-20251101":   "claude-4.5-opus",
+		"claude-sonnet-4-5-20251101": "claude-4.5-sonnet",
+		"claude-opus-4-5-latest":     "claude-4.5-opus",
+		"claude-sonnet-4-5-latest":   "claude-4.5-sonnet",
+		"claude-haiku-4-5-20251001":  "claude-4.5-haiku",
+		"claude-haiku-4-5-latest":    "claude-4.5-haiku",
+		// N10: dotted-form aliases. Anthropic SDK callers pass either the
+		// dashed form ("claude-opus-4-5") or the dotted form
+		// ("claude-opus-4.5"). The catalog canonical key is "claude-4.5-opus"
+		// (version-then-family form) so neither call site finds it without
+		// these explicit redirects.
+		"claude-haiku-4-5":           "claude-4.5-haiku",
+		"claude-haiku-4.5":           "claude-4.5-haiku",
+		"claude-haiku-4.5-latest":    "claude-4.5-haiku",
+		"claude-sonnet-4-5":          "claude-4.5-sonnet",
+		"claude-sonnet-4.5":          "claude-4.5-sonnet",
+		"claude-sonnet-4.5-thinking": "claude-4.5-sonnet-thinking",
+		"claude-opus-4-5":            "claude-4.5-opus",
+		"claude-opus-4.5":            "claude-4.5-opus",
+		"claude-opus-4.5-thinking":   "claude-4.5-opus-thinking",
 
 		// Claude 3.7.
 		"claude-3-7-sonnet-20250219": "claude-3.7-sonnet",
@@ -288,9 +309,17 @@ func TierModels(tier string) []string {
 }
 
 // IsTierAllowed reports whether a tier can call modelKey.
+//
+// N9 (fresh-account 403 race): tier="unknown" is the brand-new-account
+// state before the capability probe completes. Returning false for every
+// non-free model in that window 403s every premium request the user makes
+// in the first ~10 seconds after `addAccount`. Treat unknown like pro so
+// the request routes optimistically; UpdateCapability() learns the actual
+// outcome from the upstream response and the next probe converts to the
+// real tier within minutes. Free tier and expired remain strict.
 func IsTierAllowed(tier, modelKey string) bool {
 	switch tier {
-	case "pro":
+	case "pro", "unknown", "":
 		_, ok := catalog[modelKey]
 		return ok
 	case "expired":
@@ -303,4 +332,48 @@ func IsTierAllowed(tier, modelKey string) bool {
 		}
 		return false
 	}
+}
+
+// ─── N11 — Rate-limit fallback chain ───────────────────────────
+//
+// When EVERY active account is rate-limited on a specific model, fall back
+// once to the next-tier-down within the same family before returning 429.
+// One hop only — chat.go marks the request body with a fallbackHop flag
+// to prevent infinite descent.
+var fallbackChain = map[string]string{
+	// Claude reasoning ladder
+	"claude-opus-4-7-max":         "claude-opus-4-7-xhigh",
+	"claude-opus-4-7-xhigh":       "claude-opus-4-7-high",
+	"claude-opus-4-7-high":        "claude-opus-4-7-medium",
+	"claude-opus-4-7-medium":      "claude-opus-4-7-low",
+	"claude-opus-4-7-low":         "claude-opus-4.6",
+	"claude-opus-4.6-thinking":    "claude-opus-4.6",
+	"claude-opus-4.6":             "claude-4.5-opus",
+	"claude-4.5-opus-thinking":    "claude-4.5-opus",
+	"claude-4.5-opus":             "claude-sonnet-4.6",
+	"claude-sonnet-4.6-thinking":  "claude-sonnet-4.6",
+	"claude-sonnet-4.6":           "claude-4.5-sonnet",
+	"claude-4.5-sonnet-thinking":  "claude-4.5-sonnet",
+	"claude-4.5-sonnet":           "claude-4.5-haiku",
+	"claude-4.5-haiku":            "gemini-2.5-flash",
+	// GPT ladder
+	"gpt-5.5-xhigh":  "gpt-5.5-high",
+	"gpt-5.5-high":   "gpt-5.5-medium",
+	"gpt-5.5-medium": "gpt-5.5-low",
+	"gpt-5.5-low":    "gpt-5.2",
+	"gpt-5.2-xhigh":  "gpt-5.2-high",
+	"gpt-5.2-high":   "gpt-5.2",
+	"gpt-5.2":        "gpt-5.1",
+	"gpt-5.1":        "gpt-5",
+	"gpt-5-high":     "gpt-5-medium",
+	"gpt-5-medium":   "gpt-5",
+	"gpt-5":          "gpt-4.1",
+	"gpt-4.1":        "gpt-4o",
+	"gpt-4o":         "gpt-4o-mini",
+}
+
+// FallbackFor returns the next-best fallback model when the given model is
+// uniformly rate-limited. Returns "" when there's no further fallback.
+func FallbackFor(modelKey string) string {
+	return fallbackChain[modelKey]
 }

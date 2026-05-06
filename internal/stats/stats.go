@@ -41,6 +41,16 @@ type AccountCounts struct {
 	Requests int `json:"requests"`
 	Success  int `json:"success"`
 	Errors   int `json:"errors"`
+	// N25/N26 — per-account circuit-breaker counters. Incremented by
+	// chat.go at the corresponding error-classification site so the
+	// dashboard can show "this account has burned 12 rate-limit events
+	// this week, that one has 3 internal-error quarantines, …".
+	RateLimitEvents     int   `json:"rateLimitEvents,omitempty"`
+	InternalErrorEvents int   `json:"internalErrorEvents,omitempty"`
+	QuarantineEvents    int   `json:"quarantineEvents,omitempty"`
+	FallbackEvents      int   `json:"fallbackEvents,omitempty"`
+	LastEventAt         int64 `json:"lastEventAt,omitempty"`
+	LastEventType       string `json:"lastEventType,omitempty"`
 }
 
 type HourBucket struct {
@@ -151,6 +161,43 @@ func scheduleSave() {
 func getHourKey() string {
 	d := time.Now().UTC()
 	return time.Date(d.Year(), d.Month(), d.Day(), d.Hour(), 0, 0, 0, time.UTC).Format(time.RFC3339)
+}
+
+// N25/N26 — RecordCircuitEvent bumps the per-account event counter.
+// Called by chat.go at MarkRateLimited / ReportInternalError / fallback
+// sites so the dashboard can render a per-account reliability picture.
+// kind ∈ {"rateLimit", "internalError", "quarantine", "fallback"}.
+func RecordCircuitEvent(accountID, kind string) {
+	if accountID == "" || kind == "" {
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if state.AccountCounts == nil {
+		state.AccountCounts = map[string]*AccountCounts{}
+	}
+	key := accountID
+	if len(key) > 8 {
+		key = key[:8]
+	}
+	ac, ok := state.AccountCounts[key]
+	if !ok {
+		ac = &AccountCounts{}
+		state.AccountCounts[key] = ac
+	}
+	switch kind {
+	case "rateLimit":
+		ac.RateLimitEvents++
+	case "internalError":
+		ac.InternalErrorEvents++
+	case "quarantine":
+		ac.QuarantineEvents++
+	case "fallback":
+		ac.FallbackEvents++
+	}
+	ac.LastEventAt = time.Now().UnixMilli()
+	ac.LastEventType = kind
+	scheduleSave()
 }
 
 // Record one completed request. token counts + upstreamStatus are optional

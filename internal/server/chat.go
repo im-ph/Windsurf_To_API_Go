@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -50,6 +51,14 @@ type ChatRequestBody struct {
 	Messages   []toolemu.OAIMessage `json:"messages"`
 	Tools      []toolemu.Tool      `json:"tools,omitempty"`
 	ToolChoice json.RawMessage     `json:"tool_choice,omitempty"`
+	// N1 — caller-scope signals. OpenAI Chat passes `user`; OpenAI
+	// Responses adds `previous_response_id` and `conversation`; Anthropic
+	// nests both under `metadata` (with `user_id` carrying Claude Code's
+	// JSON-encoded device_id/account_uuid/session_id triple).
+	User               string         `json:"user,omitempty"`
+	Conversation       string         `json:"conversation,omitempty"`
+	PreviousResponseID string         `json:"previous_response_id,omitempty"`
+	Metadata           map[string]any `json:"metadata,omitempty"`
 }
 
 // ChatCompletions handles POST /v1/chat/completions.
@@ -195,20 +204,30 @@ func (d *Deps) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Cache key (only applicable when no streaming or for replay).
-	// IdentityPrompt participates so toggling the identity flag off between
-	// two otherwise-identical requests doesn't replay a previously-stamped
-	// response.
-	ckey := cache.Key(cache.RequestBody{
-		Model: modelKey, Messages: raw, Tools: rawFromTools(body.Tools), ToolChoice: body.ToolChoice,
-		MaxTokens:      body.MaxTokens,
-		IdentityPrompt: identityPrompt,
-	})
-
 	chatID := genChatID()
 	created := time.Now().Unix()
 
 	clientSalt := clientIPSalt(r)
+
+	// N1 — derive a per-caller scope from authenticated apiKey + body.user /
+	// metadata.conversation_id / metadata.session_id / previous_response_id.
+	// Falls back to clientSalt (IP+UA) when no body signal is present.
+	// Without this, two distinct downstream clients sharing one upstream
+	// apiKey see each other's responses on identical bodies. Threaded
+	// through cache.Key() AND convpool fingerprints (clientSalt already
+	// covers convpool; cache previously had no caller dimension at all).
+	callerScope := callerScopeFor(r, body)
+
+	// Cache key (only applicable when no streaming or for replay).
+	// IdentityPrompt participates so toggling the identity flag off between
+	// two otherwise-identical requests doesn't replay a previously-stamped
+	// response. CallerScope partitions multi-tenant deployments.
+	ckey := cache.Key(cache.RequestBody{
+		Model: modelKey, Messages: raw, Tools: rawFromTools(body.Tools), ToolChoice: body.ToolChoice,
+		MaxTokens:      body.MaxTokens,
+		IdentityPrompt: identityPrompt,
+		CallerScope:    callerScope,
+	})
 
 	if body.Stream {
 		d.streamChat(w, r, streamInput{
@@ -219,6 +238,7 @@ func (d *Deps) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			IdentityPrompt: identityPrompt,
 			CacheKey:       ckey,
 			ClientSalt:     clientSalt,
+			Tools:          body.Tools,
 		})
 		return
 	}
@@ -229,6 +249,7 @@ func (d *Deps) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		EmulateTools: emulateTools, ToolPreamble: toolPreamble,
 		CacheKey:   ckey,
 		ClientSalt: clientSalt,
+		Tools:      body.Tools,
 	})
 }
 
@@ -257,6 +278,104 @@ func clientIPSalt(r *http.Request) string {
 	return ""
 }
 
+// N1 — Build a per-caller scope from request signals.
+//
+// Preference order (most specific first):
+//  1. apiKey hash + body.user/conversation/previous_response_id/metadata
+//     (covers Anthropic SDK's metadata.user_id JSON-encoded device_id;
+//     OpenAI Responses' previous_response_id/conversation; OpenAI Chat
+//     classic `user` string)
+//  2. apiKey hash + IP+UA (apiKey-mode fallback when no body signal —
+//     same pattern as Node caller-key.js)
+//  3. IP+UA bare (no upstream apiKey at all — typically loopback dev)
+//
+// Returns a 16-char hex digest. Empty string only when neither apiKey
+// nor IP-UA can be derived (deeply unusual; loopback test harnesses).
+func callerScopeFor(r *http.Request, body ChatRequestBody) string {
+	apiKey := bearerToken(r)
+	body_sub := bodyCallerSubKey(body)
+	ipua := ipUAFingerprint(r)
+	h := sha256.New()
+	if apiKey != "" {
+		h.Write([]byte("api:"))
+		h.Write([]byte(apiKey))
+		h.Write([]byte{0})
+	}
+	if body_sub != "" {
+		h.Write([]byte("user:"))
+		h.Write([]byte(body_sub))
+		h.Write([]byte{0})
+	} else if ipua != "" {
+		h.Write([]byte("client:"))
+		h.Write([]byte(ipua))
+		h.Write([]byte{0})
+	}
+	if apiKey == "" && body_sub == "" && ipua == "" {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// bodyCallerSubKey extracts a per-user signal from the request body,
+// joining all available fields so a client passing both `user` and
+// `metadata.session_id` gets a different scope than one passing just
+// `user`. N14 (Claude Code 2.x device_id) is handled here too —
+// metadata.user_id may be a JSON-encoded {device_id,...} blob.
+func bodyCallerSubKey(body ChatRequestBody) string {
+	parts := make([]string, 0, 5)
+	if body.User != "" {
+		parts = append(parts, "u="+body.User)
+	}
+	if body.Conversation != "" {
+		parts = append(parts, "c="+body.Conversation)
+	}
+	if body.PreviousResponseID != "" {
+		parts = append(parts, "p="+body.PreviousResponseID)
+	}
+	if body.Metadata != nil {
+		if v, ok := body.Metadata["conversation_id"].(string); ok && v != "" {
+			parts = append(parts, "mc="+v)
+		}
+		if v, ok := body.Metadata["session_id"].(string); ok && v != "" {
+			parts = append(parts, "ms="+v)
+		}
+		// Anthropic SDK / Claude Code 2.x: metadata.user_id is a JSON-
+		// encoded {device_id, account_uuid, session_id} triple. Try a
+		// JSON parse first, fall back to opaque string.
+		if uid, ok := body.Metadata["user_id"].(string); ok && uid != "" {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(uid), &m); err == nil {
+				for _, k := range []string{"device_id", "deviceId", "session_id", "sessionId", "account_uuid", "accountUuid"} {
+					if v, ok := m[k].(string); ok && v != "" {
+						parts = append(parts, "mu="+v)
+						break
+					}
+				}
+			} else {
+				parts = append(parts, "mu="+uid)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "|")
+}
+
+// ipUAFingerprint joins client IP + User-Agent so two devices behind one
+// NAT'd outbound IP still get distinct scopes when their UAs differ.
+// Falls back to just IP or just UA if one is missing.
+func ipUAFingerprint(r *http.Request) string {
+	ip := clientIPSalt(r)
+	ua := r.Header.Get("User-Agent")
+	if ip == "" && ua == "" {
+		return ""
+	}
+	return ip + "\x00" + ua
+}
+
+// bearerToken is defined in server.go (same package) and used as-is here.
+
 type streamInput struct {
 	ChatID         string
 	Created        int64
@@ -275,6 +394,27 @@ type streamInput struct {
 	// end up reusing each other's cascade_id and bleeding context.
 	// Sourced from X-Forwarded-For → X-Real-IP → RemoteAddr.
 	ClientSalt string
+	// N11 — automatic rate-limit fallback hop counter. nonStreamChat /
+	// streamChat increment this when retrying with a downgraded model
+	// after every active account is rate-limited on the original. Bound
+	// to one hop to avoid silently downgrading three tiers.
+	FallbackHop int
+	// N13 / N23 — caller-declared tools for NLU intent recovery. Used by
+	// runOnce when the canonical <tool_call> parser returns 0 results so
+	// we can rescan the model's narrative output for tool intents.
+	Tools []toolemu.Tool
+}
+
+// lastUserMessageText returns the text of the most recent user turn in
+// msgs, or "" when none. Used to gate Layer-3 NLU recovery: pure narrative
+// is only believed when the user actually asked for an action.
+func lastUserMessageText(msgs []client.ChatMsg) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			return msgs[i].Content
+		}
+	}
+	return ""
 }
 
 // ─── Non-stream ────────────────────────────────────────────
@@ -285,6 +425,17 @@ func (d *Deps) nonStreamChat(w http.ResponseWriter, r *http.Request, in streamIn
 		logx.Info("Chat: cache HIT model=%s flow=non-stream", in.DisplayModel)
 		stats.Record(in.DisplayModel, true, 0, "", 0, 0, 200)
 		writeJSON(w, http.StatusOK, nonStreamBody(in, v.Text, v.Thinking, nil, nil, "stop", true))
+		return
+	}
+
+	// N18 — drought mode. When every active account is below the weekly
+	// quota threshold, hard-block premium models with 503 instead of
+	// burning the residual quota on retry storms. Free-tier-shared models
+	// pass through.
+	if d.Pool.IsModelBlockedByDrought(in.ModelKey) {
+		writeJSON(w, http.StatusServiceUnavailable, errBody(
+			fmt.Sprintf("%s 当前不可用：所有账号本周配额已接近耗尽（drought mode）。请稍后重试或添加账号。", in.DisplayModel),
+			"drought_mode"))
 		return
 	}
 
@@ -327,6 +478,7 @@ func (d *Deps) nonStreamChat(w http.ResponseWriter, r *http.Request, in streamIn
 			if rl, err := cloud.CheckMessageRateLimit(acct.APIKey, px); err == nil && !rl.HasCapacity {
 				logx.Warn("Preflight: %s has no capacity (remaining=%d), skipping", acct.Email, rl.MessagesRemaining)
 				d.Pool.MarkRateLimited(acct.APIKey, 5*time.Minute, in.ModelKey)
+				stats.RecordCircuitEvent(acct.ID, "rateLimit")
 				continue
 			}
 		}
@@ -364,6 +516,7 @@ func (d *Deps) nonStreamChat(w http.ResponseWriter, r *http.Request, in streamIn
 			}
 			if cerr.isInternal {
 				d.Pool.ReportInternalError(acct.APIKey)
+				stats.RecordCircuitEvent(acct.ID, "internalError")
 				last = cerr
 				continue
 			}
@@ -425,6 +578,22 @@ func (d *Deps) nonStreamChat(w http.ResponseWriter, r *http.Request, in streamIn
 		"", 0, 0, lastStatus)
 	if last == nil {
 		if all, retry := d.Pool.IsAllRateLimited(in.ModelKey); all {
+			// N11 — try one fallback hop before surfacing 429.
+			if in.FallbackHop == 0 {
+				if fk := models.FallbackFor(in.ModelKey); fk != "" && fk != in.ModelKey {
+					if info := models.Get(fk); info != nil {
+						logx.Info("rate-limit fallback: %s -> %s", in.DisplayModel, info.Name)
+						next := in
+						next.FallbackHop = 1
+						next.ModelKey = fk
+						next.DisplayModel = info.Name
+						next.Info = info
+						next.Cascade = info.ModelUID != ""
+						d.nonStreamChat(w, r, next)
+						return
+					}
+				}
+			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", retry/1000+1))
 			writeJSON(w, http.StatusTooManyRequests, errBody(
 				fmt.Sprintf("%s 所有账号均已达速率限制，请 %d 秒后重试", in.DisplayModel, retry/1000+1),
@@ -563,6 +732,34 @@ func (d *Deps) runOnce(ctx context.Context, cli *client.Client, in streamInput, 
 		out.Thinking = thinking
 		if in.EmulateTools {
 			out.ToolCalls = parsed.ToolCalls
+			// N13 / N23 — NLU intent recovery. GLM-4.7 / GLM-5.x / Kimi /
+			// Qwen often follow the spirit of the tool preamble but emit
+			// their decision as natural-language narration instead of the
+			// canonical <tool_call> markup. Re-scan the post-strip text
+			// for invocation intent when (a) the canonical parser got
+			// nothing AND (b) the client declared tools[]. Layered
+			// extraction is conservative — false positives drive bad
+			// agent loops.
+			if len(out.ToolCalls) == 0 && in.Tools != nil && out.Text != "" {
+				userTail := lastUserMessageText(in.CascadeMsgs)
+				recovered := toolemu.ExtractIntent(out.Text, in.Tools, userTail)
+				if len(recovered) > 0 {
+					tcs := make([]toolemu.ToolCall, 0, len(recovered))
+					for _, r := range recovered {
+						tcs = append(tcs, toolemu.ToolCall{
+							ID:            r.ID,
+							Name:          r.Name,
+							ArgumentsJSON: r.ArgumentsJSON,
+						})
+					}
+					out.ToolCalls = tcs
+					layers := make([]string, 0, len(recovered))
+					for _, r := range recovered {
+						layers = append(layers, r.Layer)
+					}
+					logx.Info("NLU intent recovery: %d call(s) via [%s]", len(recovered), strings.Join(layers, ","))
+				}
+			}
 		}
 		out.Usage = buildUsageFromCascade(res.Usage, in.CascadeMsgs, out.Text, out.Thinking)
 		return out, nil
@@ -619,6 +816,39 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, errBody("streaming not supported", "server_error"))
 		return
+	}
+	// N18 — drought-mode pre-flight (stream). Returning 503 before writing
+	// SSE headers means the client gets a clean error response, not a
+	// partially-formed event stream.
+	if d.Pool.IsModelBlockedByDrought(in.ModelKey) {
+		writeJSON(w, http.StatusServiceUnavailable, errBody(
+			fmt.Sprintf("%s 当前不可用：所有账号本周配额已接近耗尽（drought mode）。请稍后重试或添加账号。", in.DisplayModel),
+			"drought_mode"))
+		return
+	}
+
+	// N11 — pre-flight rate-limit fallback. If we already KNOW every active
+	// account is rate-limited on the requested model (probe / pool state),
+	// downgrade to the next-tier model BEFORE writing SSE response headers.
+	// The in-loop all-rate-limited path at the bottom of this function can
+	// no longer recurse (headers already sent) so it surfaces the error
+	// chunk; pre-flight catches the common saturated-state case.
+	if in.FallbackHop == 0 {
+		if all, _ := d.Pool.IsAllRateLimited(in.ModelKey); all {
+			if fk := models.FallbackFor(in.ModelKey); fk != "" && fk != in.ModelKey {
+				if info := models.Get(fk); info != nil {
+					logx.Info("rate-limit fallback (pre-flight stream): %s -> %s", in.DisplayModel, info.Name)
+					next := in
+					next.FallbackHop = 1
+					next.ModelKey = fk
+					next.DisplayModel = info.Name
+					next.Info = info
+					next.Cascade = info.ModelUID != ""
+					d.streamChat(w, r, next)
+					return
+				}
+			}
+		}
 	}
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -806,6 +1036,7 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 			if rl, err := cloud.CheckMessageRateLimit(acct.APIKey, px); err == nil && !rl.HasCapacity {
 				logx.Warn("Preflight: %s has no capacity (remaining=%d), skipping", acct.Email, rl.MessagesRemaining)
 				d.Pool.MarkRateLimited(acct.APIKey, 5*time.Minute, in.ModelKey)
+				stats.RecordCircuitEvent(acct.ID, "rateLimit")
 				continue
 			}
 		}
@@ -856,6 +1087,7 @@ func (d *Deps) streamChat(w http.ResponseWriter, r *http.Request, in streamInput
 			}
 			if ce.isInternal {
 				d.Pool.ReportInternalError(acct.APIKey)
+				stats.RecordCircuitEvent(acct.ID, "internalError")
 			}
 			if ce.isModel && !ce.isRateLimit && !ce.isInternal {
 				d.Pool.UpdateCapability(acct.APIKey, in.ModelKey, false, "model_error")

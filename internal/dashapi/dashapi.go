@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"windsurfapi/internal/auth"
@@ -29,6 +30,7 @@ import (
 	"windsurfapi/internal/config"
 	"windsurfapi/internal/convpool"
 	"windsurfapi/internal/firebase"
+	"windsurfapi/internal/i18n"
 	"windsurfapi/internal/langserver"
 	"windsurfapi/internal/logx"
 	"windsurfapi/internal/modelaccess"
@@ -82,6 +84,117 @@ func secretEqual(got, want string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
+// ─── N27 — Brute-force lockout for dashboard auth ────────────────
+//
+// Tracks failed dashboard auth attempts per client IP. After
+// lockoutThreshold failures, the IP is locked for lockoutDuration. The
+// lockout state is checked BEFORE the constant-time compare so a fast
+// comparator can't bypass the lock. Idle entries are pruned on every
+// successful check so the map can't grow unbounded.
+
+const (
+	lockoutThreshold      = 5
+	lockoutDuration       = 30 * time.Minute
+	lockoutIdleTTL        = 2 * time.Hour
+)
+
+type lockoutState struct {
+	count        int
+	blockedUntil time.Time
+	lastActivity time.Time
+}
+
+var (
+	lockoutMu sync.Mutex
+	lockouts  = map[string]*lockoutState{}
+)
+
+func clientIP(r *http.Request) string {
+	// Best-effort: prefer RemoteAddr (not attacker-spoofable). Strip the port
+	// so multiple connections from the same host share one bucket.
+	addr := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return addr
+}
+
+// checkLockout returns (blocked, retryAfterMs). Call BEFORE the password
+// compare; if blocked, reject without comparing so the lockout can't be
+// short-circuited by a faster comparator.
+func checkLockout(ip string) (bool, int64) {
+	if ip == "" {
+		return false, 0
+	}
+	lockoutMu.Lock()
+	defer lockoutMu.Unlock()
+	e := lockouts[ip]
+	if e == nil {
+		return false, 0
+	}
+	now := time.Now()
+	if e.blockedUntil.After(now) {
+		return true, int64(e.blockedUntil.Sub(now) / time.Millisecond)
+	}
+	if !e.blockedUntil.IsZero() && !e.blockedUntil.After(now) {
+		// Ban expired — reset the counter.
+		e.count = 0
+		e.blockedUntil = time.Time{}
+	}
+	return false, 0
+}
+
+// failedAuthAttempt increments the per-IP counter and locks the IP when
+// the threshold is hit. Returns the new (blocked, retryAfterMs) tuple
+// for the caller to surface in the response body.
+func failedAuthAttempt(ip string) (bool, int64) {
+	if ip == "" {
+		return false, 0
+	}
+	now := time.Now()
+	lockoutMu.Lock()
+	defer lockoutMu.Unlock()
+	purgeLockoutsLocked(now)
+	e := lockouts[ip]
+	if e == nil {
+		e = &lockoutState{lastActivity: now}
+		lockouts[ip] = e
+	}
+	e.count++
+	e.lastActivity = now
+	if e.count >= lockoutThreshold {
+		e.blockedUntil = now.Add(lockoutDuration)
+		e.count = 0
+	}
+	if e.blockedUntil.After(now) {
+		return true, int64(e.blockedUntil.Sub(now) / time.Millisecond)
+	}
+	return false, 0
+}
+
+// successfulAuthAttempt clears the per-IP failure counter on success.
+func successfulAuthAttempt(ip string) {
+	if ip == "" {
+		return
+	}
+	lockoutMu.Lock()
+	defer lockoutMu.Unlock()
+	delete(lockouts, ip)
+}
+
+// purgeLockoutsLocked drops idle entries (no activity for lockoutIdleTTL
+// AND no active ban). Caller holds lockoutMu.
+func purgeLockoutsLocked(now time.Time) {
+	for ip, e := range lockouts {
+		if e.blockedUntil.After(now) {
+			continue
+		}
+		if now.Sub(e.lastActivity) > lockoutIdleTTL {
+			delete(lockouts, ip)
+		}
+	}
+}
+
 func (d *Deps) route(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		writeJSON(w, http.StatusNoContent, nil)
@@ -92,20 +205,63 @@ func (d *Deps) route(w http.ResponseWriter, r *http.Request) {
 		sub = "/"
 	}
 
-	// /auth check endpoint is always open.
+	// N27: brute-force lockout — reject blocked IPs BEFORE comparing the
+	// password. A fast comparator can't bypass the gate this way.
+	ip := clientIP(r)
+	if blocked, retryMs := checkLockout(ip); blocked {
+		w.Header().Set("Retry-After", strconv.FormatInt(retryMs/1000+1, 10))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"error":         "Too many failed attempts. Try again later.",
+			"retryAfterMs":  retryMs,
+		})
+		return
+	}
+
+	// /auth check endpoint is always open (but still subject to lockout).
 	if sub == "/auth" {
 		needs := d.Cfg.DashboardPassword != "" || d.Cfg.APIKey != ""
 		if !needs {
 			writeJSON(w, http.StatusOK, map[string]any{"required": false})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"required": true, "valid": d.checkAuth(r)})
+		valid := d.checkAuth(r)
+		if !valid {
+			blocked, retryMs := failedAuthAttempt(ip)
+			logx.Warn("Dashboard /auth failed from %s (blocked=%v)", ip, blocked)
+			if blocked {
+				w.Header().Set("Retry-After", strconv.FormatInt(retryMs/1000+1, 10))
+				writeJSON(w, http.StatusTooManyRequests, map[string]any{
+					"required":      true,
+					"valid":         false,
+					"error":         "Too many failed attempts. Try again later.",
+					"retryAfterMs":  retryMs,
+				})
+				return
+			}
+		} else {
+			successfulAuthAttempt(ip)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"required": true, "valid": valid})
 		return
 	}
 
 	if !d.checkAuth(r) {
+		// Only count as a failed attempt when auth is actually required.
+		if d.Cfg.DashboardPassword != "" || d.Cfg.APIKey != "" {
+			blocked, retryMs := failedAuthAttempt(ip)
+			logx.Warn("Dashboard auth failed from %s (blocked=%v)", ip, blocked)
+			if blocked {
+				w.Header().Set("Retry-After", strconv.FormatInt(retryMs/1000+1, 10))
+				writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "Too many failed attempts. Try again later.", "retryAfterMs": retryMs})
+				return
+			}
+		}
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "Unauthorized. Set X-Dashboard-Password header."})
 		return
+	}
+	// Success — clear the lockout counter.
+	if d.Cfg.DashboardPassword != "" || d.Cfg.APIKey != "" {
+		successfulAuthAttempt(ip)
 	}
 
 	body := map[string]any{}
@@ -156,6 +312,25 @@ func (d *Deps) route(w http.ResponseWriter, r *http.Request) {
 		d.gitStatusHandler(w)
 	case sub == "/self-update" && r.Method == http.MethodPost:
 		d.selfUpdate(w, body)
+	// N20 — local Windsurf credential discovery / import.
+	case sub == "/local-windsurf" && r.Method == http.MethodGet:
+		d.HandleLocalWindsurfStatus(w, r)
+	case sub == "/local-windsurf/import" && r.Method == http.MethodPost:
+		d.HandleLocalWindsurfImport(w, r)
+	// N19 — i18n locale list + per-locale JSON for the SPA's runtime
+	// language switcher.
+	case sub == "/i18n" && r.Method == http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{"locales": i18n.AvailableLocales()})
+	case strings.HasPrefix(sub, "/i18n/") && r.Method == http.MethodGet:
+		code := strings.TrimPrefix(sub, "/i18n/")
+		data, err := i18n.Locale(code)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "locale not found"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		_, _ = w.Write(data)
 
 	case sub == "/cache" && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, cache.Snapshot())

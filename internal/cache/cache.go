@@ -130,12 +130,26 @@ type RequestBody struct {
 	TopP           *float64        `json:"top_p,omitempty"`
 	MaxTokens      *int            `json:"max_tokens,omitempty"`
 	IdentityPrompt string          `json:"identityPrompt,omitempty"`
+	// CallerScope partitions the cache by caller identity (apiKey hash +
+	// body.user / conversation_id / device_id / IP+UA fallback). Without
+	// this, two distinct downstream clients sharing one upstream API key
+	// see each other's responses on identical request bodies — a
+	// multi-tenant correctness bug. (N1)
+	CallerScope string `json:"callerScope,omitempty"`
 }
 
+// Key derives the cache key from the request body. CallerScope is folded
+// into the digest with an explicit `\x00` separator so two callers can't
+// collide by crafting bodies that serialize to identical strings.
 func Key(body RequestBody) string {
+	scope := body.CallerScope
+	body.CallerScope = "" // strip from Marshal so order doesn't matter for legacy callers
 	b, _ := json.Marshal(body)
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
+	h := sha256.New()
+	h.Write([]byte(scope))
+	h.Write([]byte{0})
+	h.Write(b)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Get returns a non-expired entry and refreshes its LRU position. The value

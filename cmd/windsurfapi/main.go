@@ -69,17 +69,48 @@ func main() {
 				_ = os.RemoveAll("/tmp/windsurf-workspace/" + e.Name())
 			}
 		}
+		// N14 (#96): drop a sentinel so the LS workspace looks like a
+		// populated project directory, not an empty one. Cascade's baked-
+		// in tool prompts otherwise hit "the workspace appears empty" and
+		// start narrating "let me create files at /tmp/windsurf-workspace/…"
+		// — leaking the internal path back to the API caller. Marker
+		// content is intentionally generic so the model doesn't latch onto
+		// it as a project fact.
+		_ = os.WriteFile("/tmp/windsurf-workspace/.windsurf-proxy-workspace", []byte(
+			"This directory is a synthetic workspace for an API proxy. "+
+				"It does not contain user files. Do not narrate paths under this directory "+
+				"to the user. Do not create or read files here.\n"), 0o644)
 	}
 
 	// 3) LS pool
 	lsp := langserver.New()
 	lsp.Config(cfg.LSBinaryPath, cfg.CodeiumAPIURL)
+	// Periodic TCP health probe on every pool entry — 30s tick, two
+	// consecutive misses triggers kill + respawn. Complements the
+	// cmd.Wait exit watcher (catches hung-but-alive LS) and the
+	// cmd.Wait auto-respawn path (catches silent / adopted deaths).
+	lsp.StartWatchdog()
 	if _, err := os.Stat(cfg.LSBinaryPath); err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		if _, err := lsp.Ensure(ctx, nil); err != nil {
-			logx.Error("Language server failed to start: %s", err.Error())
+		// Retry the initial spawn with backoff — a tight systemd restart
+		// can leave :42100 in TIME_WAIT, causing LS's own internal
+		// manager→worker self-connect to time out on the first try.
+		// Successive retries ride out the kernel's port reaper window.
+		// Failure here is NOT fatal: the pool's cmd.Wait auto-respawn
+		// (added alongside this) will keep retrying every ~2s once main
+		// enters its request loop, and any incoming chat request also
+		// triggers a fresh Ensure. We log and move on.
+		for attempt := 1; attempt <= 3; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			_, err := lsp.Ensure(ctx, nil)
+			cancel()
+			if err == nil {
+				break
+			}
+			logx.Warn("Language server spawn attempt %d failed: %s", attempt, err.Error())
+			if attempt < 3 {
+				time.Sleep(3 * time.Second)
+			}
 		}
-		cancel()
 	} else {
 		logx.Warn("Language server binary not found at %s", cfg.LSBinaryPath)
 		logx.Warn("Install it: download Windsurf Linux tarball and extract language_server_linux_x64")
@@ -157,10 +188,12 @@ func main() {
 	logx.Info("Server on http://%s:%d", cfg.BindHost, cfg.Port)
 	logx.Info("  POST /v1/chat/completions  (OpenAI compatible)")
 	logx.Info("  POST /v1/messages          (Anthropic compatible)")
+	logx.Info("  POST /v1/responses         (Codex CLI compatible)")
 	logx.Info("  GET  /v1/models")
 	logx.Info("  POST /auth/login           (api_key / token / email+password)")
 	logx.Info("  GET  /auth/accounts, DELETE /auth/accounts/:id")
 	logx.Info("  GET  /auth/status, /health")
+	emitNoAuthWarnings(cfg)
 
 	// 7) graceful shutdown
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -185,6 +218,37 @@ func main() {
 	_ = srv.Shutdown(shutCtx)
 	lsp.StopAll()
 	logx.Info("HTTP server closed, stopping language server")
+}
+
+// N4: emit a fat warning banner when the proxy is bound publicly with no
+// authentication configured. Only fires on non-loopback binds. Operators
+// who set ALLOW_OPEN=1 to deliberately skip the loopback gate still see
+// this so it's clear what they signed up for.
+func emitNoAuthWarnings(cfg *config.Config) {
+	host := strings.ToLower(strings.TrimSpace(cfg.BindHost))
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	if host == "127.0.0.1" || host == "localhost" || host == "::1" || strings.HasPrefix(host, "::ffff:127.") {
+		return
+	}
+	apiOpen := cfg.APIKey == ""
+	dashOpen := cfg.DashboardPassword == ""
+	if !apiOpen && !dashOpen {
+		return
+	}
+	for _, line := range []string{
+		"+------------------------------------------------------------------+",
+		"| WARNING: AUTHENTICATION IS NOT CONFIGURED                        |",
+		"| 警告：当前服务未配置访问认证                                      |",
+		"|                                                                  |",
+		"| This server is listening beyond localhost. Set API_KEY for       |",
+		"| REST APIs and DASHBOARD_PASSWORD for the dashboard write surface |",
+		"| before exposing the proxy publicly.                              |",
+		"| 服务正在非本机地址监听。公网/内网暴露前请配置 API_KEY 与          |",
+		"| DASHBOARD_PASSWORD 两个凭据。                                     |",
+		"+------------------------------------------------------------------+",
+	} {
+		logx.Warn(line)
+	}
 }
 
 func splitCSV(s string) []string {

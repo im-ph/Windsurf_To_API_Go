@@ -5,6 +5,240 @@
 
 ---
 
+## [1.4.17] - 2026-05-06
+
+### Node ↔ Go 补丁 backport — 第二批 7 项
+
+把 1.4.16 留作"独立 PR"的 6 项 + 衍生 1 项全部落地。叠加 1.4.16 的 13 项,
+38 项 Node 1.4.0 补丁现在 Go 端已实施 20 项 / 已具备 14 项 / N/A 4 项 = 全
+覆盖。
+
+### 网络安全 (P0/P1)
+
+- **N3 cloud/transport SSRF 守卫**：抽 `internal/netguard/` 新包
+  (`IsPrivateIP` / `IsPrivateHost` / `ResolveAndCheckHost` / `CheckProxyURL`)
+  作为整个项目的私网/loopback/metadata-service 拒绝点。
+  [`cloud/transport.go:clientFor`](internal/cloud/transport.go) 在
+  创建 `http.Transport` 之前调 `netguard.ResolveAndCheckHost(host)`,
+  proxy 主机解析到私网即拒绝并 fallback 到直连出口(同时打 warn)。
+  也涵盖 metadata service 主机名(metadata.google.internal /
+  metadata.aws.internal / 169.254.169.254 / 100.100.100.200)以及
+  `.local` / `.internal` / `.lan` / `.home` 后缀。
+- **N22 SOCKS5 代理支持**：`langserver/pool.go` 的 `Type: "socks"
+  // not yet honoured` 标注 deprecated。`cloud/transport.go` 现在用
+  `golang.org/x/net/proxy.SOCKS5` 实现 SOCKS5 出口,带 user/pass
+  RFC1929 认证。SOCKS5 dialer 包了一层 `guardedDialer`,即便
+  SOCKS 服务器试图骗 dialer 连内网地址(`Dial("169.254.169.254:80")`)
+  也会在 TCP 打开前被 `netguard.ResolveAndCheckHost` 拦下。
+- **B-P1-3 SOCKS SSRF**(N22 同步):由 `guardedDialer` 提供。
+
+### 协议兼容 / 弹性 (P1/P2)
+
+- **N13 + N23 NLU intent-extractor**：[`toolemu/intent.go`](internal/toolemu/intent.go)
+  3 层意图识别 + 工具索引(规范名 / primary required string param)。
+  - Layer 1 explicit syntax — `func_name(arg=X)` / `function_call:
+    func_name(...)` 显式调用形式,置信度 0.9。
+  - Layer 2 backtick-quoted —``` `tool` with `arg` ``` 反引号成对模式,
+    置信度 0.7。
+  - Layer 3 narrative — "I should call X function with the command 'Y'"
+    自然语言陈述,需用户消息含 action 动词(`run`/`list`/`read`/...)才
+    放行,置信度 0.5。
+  `WINDSURFAPI_NLU_RECOVERY=0` 关闭整层。
+  - [`server/chat.go:runOnce`](internal/server/chat.go) 在 `parseAll`
+    返回 0 个 tool_calls 且声明了 tools[] 时调 `ExtractIntent`,把恢复
+    出的工具调用作为正常 ToolCall 上抛 — GLM-4.7 / GLM-5.x / Kimi /
+    Qwen 现在能在 cascade 后端可靠完成工具调用。
+  - 新增 `streamInput.Tools` 字段贯穿调用链,`lastUserMessageText`
+    helper 取最后一条 user 消息文本作为 Layer-3 gate。
+- **N24 Cascade native tool bridge**：[`toolemu/bridge.go`](internal/toolemu/bridge.go)
+  把 OpenAI 工具(Read / Bash / Glob / Grep / Write / Edit /
+  WebFetch + 各种别名)正向翻译到 Cascade native step kinds
+  (view_file / run_command / find / grep_search_v2 / list_directory /
+  edit_file / browser_open)。`CanUseNativeBridge` 是入口闸门 — 全部
+  工具能映射时才启用 bridge,部分映射会 fallback 到原 prompt
+  emulation 路径(避免混合方言把模型搞糊涂)。`BuildReverseLookup` /
+  `CascadeStepToOpenAIToolCall` 提供反向通道。
+
+### 体验 (P2)
+
+- **N19 i18n 集中化**：源 of truth 在 [`internal/i18n/`](internal/i18n/)
+  (`zh-CN.json` + `en.json`),通过 `//go:embed` 嵌进二进制。
+  `GET /dashboard/api/i18n` 返回 locale 列表;
+  `GET /dashboard/api/i18n/:locale` 返回该 locale JSON
+  (Cache-Control: public, max-age=300)。Vue SPA 在
+  [`web/src/composables/useI18n.ts`](web/src/composables/useI18n.ts)
+  提供轻量 composable(`t(key, params)` / `setLocale` /
+  `loadFromBackend`),浏览器语言自动探测,localStorage 持久化用户选择。
+  [`web/src/i18n/`](web/src/i18n/) 是构建期 fallback,与
+  `internal/i18n/` 保持同步。Vite 直接 `import zhCN from
+  '../i18n/zh-CN.json'` 编进 bundle,与运行期 fetch 互为兜底。
+- **N20 local-windsurf 凭证导入**：[`dashapi/local_windsurf.go`](internal/dashapi/local_windsurf.go)
+  扫本机 Windsurf 桌面安装的 `state.vscdb` 路径(macOS / Linux /
+  Windows / Snap;stable + Next + Insiders 三个 flavor)。
+  `GET /dashboard/api/local-windsurf` 返回候选路径列表 +
+  sqlite3 CLI 是否可用。
+  `POST /dashboard/api/local-windsurf/import {"path": "..."}` 通过
+  `sqlite3 -readonly` shell-out 读 `ItemTable WHERE key LIKE
+  '%windsurfAuthStatus%'` 抽 apiKey + email,5 秒超时,3 个 flavor
+  自动分类。无 sqlite3 CLI 时返回 manual hint("Copy state.vscdb out
+  and POST to /accounts manually")而非硬错。**不引入 CGo SQLite 依赖**
+  保持单二进制 ~13 MB。
+
+### 涉及文件
+
+- `internal/netguard/netguard.go` (新增,SSRF 守卫共享包)
+- `internal/cloud/transport.go` (N3 + N22 + guardedDialer)
+- `internal/toolemu/intent.go` (新增,N13/N23 NLU 恢复)
+- `internal/toolemu/bridge.go` (新增,N24 cascade native bridge)
+- `internal/server/chat.go` (NLU 接入 + Tools 字段 + lastUserMessageText)
+- `internal/i18n/embed.go` (新增,N19 后端 i18n 源)
+- `internal/i18n/{zh-CN,en}.json` (新增)
+- `internal/dashapi/dashapi.go` (i18n + local-windsurf 路由)
+- `internal/dashapi/local_windsurf.go` (新增,N20)
+- `web/src/composables/useI18n.ts` (新增,N19 SPA composable)
+- `web/src/i18n/{zh-CN,en}.json` (新增,SPA 构建期 fallback)
+
+### 已知后续工作(本批未涉及,留作单独 PR)
+
+- **SPA 视图字串实际外提**:目前 `composables/useI18n.ts` 已就位,
+  但各个 .vue 视图里的中文字串还是写死的。后续重构需把
+  `<h1>账号管理</h1>` 之类全部改为 `<h1>{{ t('accounts.title') }}</h1>`,
+  并把 `Accounts.vue` / `Models.vue` / `Proxy.vue` / `Stats.vue` 等所有
+  view 过一遍。这是机械工作,但跨 ~20 个文件,适合独立 PR。
+- **dist/ 重新构建**:本批改动了 `web/src/`,生效需要
+  `pnpm --dir go/web build` 后重新 commit `internal/web/dist/`。
+- **NLU 实战调校**:`intent.go` 的 regex 是首版,等 GLM-5.2 / Kimi-K3
+  上线后需要按真实 narrative 模式扩 patterns。
+
+---
+
+## [1.4.16] - 2026-05-06
+
+### Node ↔ Go 补丁 backport — 13 项实施 / 14 项已实现 / 4 N/A / 7 后续
+
+把 Node `src/` 1.4.0 的 P0/P1/P2 + Agent Team 安全 sweep 共 38 项,经 gap
+analysis 后映射到 Go 实现。已完成 13 项,先前版本已实现 14 项,4 项 N/A
+(Go 概念上不适用如 prototype pollution),剩 7 项是新增大模块保留作后续。
+
+### 安全加固 (P0)
+
+- **N4 bindHost 自动锁回环**：`config/config.go` `Load()` 检测到
+  `API_KEY=""` 且 `DASHBOARD_PASSWORD=""` 且 `ALLOW_OPEN!=1` 时,默认
+  `BindHost` 从 `0.0.0.0` 降到 `127.0.0.1`。`main.go` 启动后调
+  `emitNoAuthWarnings(cfg)`,公网 bind 但无凭据时打 fat banner。
+- **N1 cache CallerScope**：`cache/cache.go` `RequestBody.CallerScope`
+  字段 + `Key()` 用 `\x00` 分隔符把 scope 折入 digest。`server/chat.go`
+  新增 `callerScopeFor(r, body)`:apiKey hash + `body.user / conversation /
+  previous_response_id / metadata.{conversation_id, session_id, user_id}`,
+  fallback IP+UA。修共享 apiKey 多租户场景两客户端互见缓存的串响应。
+- **N14 Claude Code 2.x device_id**:`bodyCallerSubKey` 解析
+  `metadata.user_id` JSON-encoded `{device_id, account_uuid, session_id}`,
+  device_id 进入 callerScope。`cmd/main.go` 启动时在
+  `/tmp/windsurf-workspace/.windsurf-proxy-workspace` 落 marker 文件,
+  Cascade 工具提示不再 narrate "the workspace appears empty"。
+- **N5 sanitize 跨平台 + XML 块剥离**：`sanitize/sanitize.go` patterns
+  增加 Windows 反斜杠路径覆盖（`(?:[A-Za-z]:)?[/\\]home[/\\]user…`)
+  + `(?s)<workspace_information>…</workspace_information>` 等 XML 块
+  strip,Cascade 上游注入的 sandbox 元数据不再 echo 给客户端。workspace
+  替换标记从 `.` 改为 `<workspace>`,避免相对路径被工具调用重新解读为
+  Read 目标导致循环。
+- **N6 Cache-Control: no-store**：`server/server.go` `noCompress` 中间
+  件把 `Cache-Control` 从 `no-cache` 升到 `no-store`,防 sub2api / nginx
+  priority cache 把一个用户的响应误返给另一个。
+- **N9 fresh-account 403 race**：`models/catalog.go` `IsTierAllowed` 把
+  `tier="unknown"` 视同 pro 路由,新加账号到探测完成的窗口期不再 403
+  全部 premium 模型。
+
+### Agent Team OWASP
+
+- **B-P2-4 + F-P2-1 + F-P2-2 dashboard 安全头**：`server/server.go`
+  `writeSPAIndex` 新增 `X-Frame-Options: DENY`、`X-Content-Type-Options:
+  nosniff`、`Referrer-Policy: same-origin` 与完整 CSP（`default-src
+  'self'` / `frame-ancestors 'none'` / `object-src 'none'` / `base-uri
+  'none'`）。
+- **F-P1-3 sessionStorage 改造**：`web/src/api/request.ts` dashboard
+  密码从 `localStorage` 移到 `sessionStorage`,带一次性 legacy 迁移
+  逻辑。XSS 一旦发生密码暴露窗口从永久变为单次浏览会话。
+- **N27 brute-force lockout**：`dashapi/dashapi.go` per-IP 失败计数,
+  5 次/30 分钟封禁,锁定检查在 password compare 之前(快比对器无法
+  绕过)。空闲条目 2 小时后清理。
+
+### 弹性 (P1)
+
+- **N10 模型目录扩展**：`models/seed.go` 补 GPT-5.5 全 11 档(`gpt-5.5
+  -{none,low,medium,high,xhigh}` + `*-fast`)+ GPT-5.3-codex 完整 tier
+  ladder + `glm-4.7-fast` + `adaptive`(deprecated)。`catalog.go` 新增
+  Anthropic SDK dotted-form 别名(`claude-haiku-4.5` / `claude-sonnet-4.5`
+  / `claude-opus-4.5` 含 dashed/`-latest`/带日期形式)。
+- **N15 claude-opus-4-7-thinking 别名**:bare `-thinking` 不再自动路由
+  到高 effort,统一降到 medium 档,客户端要其它档需传完整名。
+- **N11 自动 model fallback**：`models/catalog.go` 新增 `fallbackChain`
+  表 + `FallbackFor()`。chat.go 在所有账号都被 rate-limited 时,先按链
+  表降一档(opus-xhigh→high→medium…→sonnet→haiku→flash)再上 429。
+  `streamInput.FallbackHop` 限制只跳一次,避免静默连降三档。流式入口
+  做 `IsAllRateLimited` 预检 + 在写 SSE header 前做 fallback。
+- **N18 drought mode**：`auth/pool.go` 新增 `IsDroughtMode()` /
+  `IsModelBlockedByDrought()` / `GetDroughtSummary()`。所有有 quota 数据
+  的活跃账号 < 5% 周配额时,premium 模型立刻 503;free-tier-shared 模型
+  (gpt-4o-mini / gemini-2.5-flash / glm-4.7 / kimi-k2 / qwen-3)继续放行。
+- **N16 probe singleflight**：`auth/ops.go` `Probe()` 加 `probesInFlight`
+  map。dashboard 手动探测 + 调度器 + 加账号自动探测同时发起对同一 id
+  时,共享同一次探测结果而非各自烧 RPM。
+
+### 可观测性 (P2)
+
+- **N25/N26 circuit breaker stats**：`stats/stats.go` `AccountCounts` 新
+  增 `RateLimitEvents` / `InternalErrorEvents` / `QuarantineEvents` /
+  `FallbackEvents` 计数 + `LastEventAt`。`RecordCircuitEvent(accountID,
+  kind)` 让 chat.go 在 `MarkRateLimited` / `ReportInternalError` 路径
+  记一次,dashboard `/dashboard/api/stats` 可呈现每账号可靠性曲线。
+
+### 已通过先前版本实现 (gap analysis 验证)
+
+`N2 fs-atomic`(atomicfile 包) / `N7 apiKey 屏蔽`(`AuthAccounts` 已
+mask)/ `N8 varint BigInt`(Go uint64 原生)/ `N12 /v1/responses`
+(1.4.0-go)/ `N17 LS orphan cleanup`(`langserver/kill_linux.go`)/
+`N21 image/pdf`(`imagex` 包)/ `B-P1-1 git command injection`
+(`isSafeBranchName`)/ `B-P1-2 timing-safe compare`
+(`subtle.ConstantTimeCompare`)/ `B-P2-3 TLS InsecureSkipVerify`
+(cloud/transport TLS 配置无 Skip)/ `F-P1-1+F-P1-2 XSS`(Vue 模板
+自动转义)。
+
+### N/A (Go 概念上不适用)
+
+`B-P2-1 prototype pollution` / Node 特定的 `BigInt varint` 隐患 /
+F-P1-* 中已被 Vue 自动转义的项。
+
+### 后续待办 (大型新增模块,留独立 PR)
+
+- **N3 cloud/transport SSRF**:抽 `internal/netguard` 包,在
+  `cloud/transport.go:clientFor` 的 proxy 设置前接入,与 dashapi 共用。
+- **N13 + N23 NLU intent-extractor**:391 行 3 层意图识别,从 GLM/Kimi
+  自然语言 narrative 恢复 tool_call。
+- **N22 SOCKS5**:`langserver/pool.go` 标 `// not yet honoured`,需要在
+  cloud/transport.go 接入 `golang.org/x/net/proxy.SOCKS5` 自定义 dialer
+  + N3 的 SSRF 守卫。
+- **N24 cascade-native-bridge**:把 OpenAI 工具(Read/Bash/Glob/Grep)
+  正向翻译到 Cascade vocabulary(view_file/run_command/find/
+  grep_search_v2),trajectory 反向翻译。
+- **N19 i18n centralised**:Vue SPA 内嵌字串外提到 `web/src/i18n/*.json`。
+- **N20 local-windsurf 凭证导入**:扫本机 Windsurf 桌面安装的
+  `state.vscdb` 抽取缓存凭据。
+
+### 涉及文件
+
+- `internal/config/config.go`、`cmd/windsurfapi/main.go`(N4 + N14 marker + emitNoAuthWarnings)
+- `internal/cache/cache.go`、`internal/server/chat.go`(N1 + N11 + N18 + N14 device_id)
+- `internal/server/server.go`(N6 + B-P2-4)
+- `internal/sanitize/sanitize.go`(N5)
+- `internal/models/seed.go`、`internal/models/catalog.go`(N9 + N10 + N11 fallback + N15)
+- `internal/auth/pool.go`(N18 drought)、`internal/auth/ops.go`(N16 singleflight)
+- `internal/dashapi/dashapi.go`(N27)
+- `internal/stats/stats.go`(N25/N26)
+- `web/src/api/request.ts`(F-P1-3)
+
+---
+
 ## [1.4.15] - 2026-04-23
 
 ### 新增
